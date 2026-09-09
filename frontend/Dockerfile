@@ -36,7 +36,8 @@ ARG VITE_API_BASE_URL=""
 # create payment attempts, never read or move money.
 ARG VITE_STRIPE_PUBLISHABLE_KEY=""
 ARG VITE_APP_NAME="CommerceFlow"
-ENV VITE_STRIPE_PUBLISHABLE_KEY=$VITE_STRIPE_PUBLISHABLE_KEY \n    VITE_API_BASE_URL=$VITE_API_BASE_URL \
+ENV VITE_STRIPE_PUBLISHABLE_KEY=$VITE_STRIPE_PUBLISHABLE_KEY \
+    VITE_API_BASE_URL=$VITE_API_BASE_URL \
     VITE_APP_NAME=$VITE_APP_NAME
 
 # `tsc -b` runs first via the build script: a type error fails the image rather than shipping.
