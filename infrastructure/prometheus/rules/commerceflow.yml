@@ -1,0 +1,115 @@
+# =====================================================================================
+# Alerting rules that reflect how this system actually fails.
+#
+# The interesting alerts are about messages that stopped moving, not about CPU.
+#
+# The orchestrator holds a deadline for every saga step, so a stuck flow is now reported by the
+# component that owns it rather than inferred from orders that have not changed in a while. That
+# gives two distinct signals: a step being re-sent (normal under load) and a saga parked because
+# it stopped answering (never normal).
+# =====================================================================================
+groups:
+  - name: commerceflow-availability
+    rules:
+      - alert: ServiceDown
+        expr: up{job="commerceflow-services"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.service }} is not being scraped"
+          description: "{{ $labels.service }} has been unreachable for more than 2 minutes."
+
+      - alert: HighServerErrorRate
+        expr: |
+          sum by (service) (rate(http_server_requests_seconds_count{status=~"5.."}[5m]))
+            / sum by (service) (rate(http_server_requests_seconds_count[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }} is returning 5xx for more than 5% of requests"
+
+  - name: commerceflow-saga
+    rules:
+      # A parked saga has already exhausted its retries. The orchestrator deliberately stops
+      # rather than compensating on a guess, because a silent payment step may have taken the
+      # money. Every one of these needs a human.
+      - alert: StalledOrderSagas
+        expr: commerceflow_saga_stalled > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Order sagas are parked and waiting for an operator"
+          description: >-
+            {{ $value }} saga(s) stopped getting replies and exhausted their retry budget.
+            Query saga_step_log for the failing step, then check that participant and its DLT.
+
+      # Held stock that no saga will finish. Not urgent by the minute, but it never resolves on
+      # its own and every hour it sits there is stock nobody can buy.
+      - alert: StaleInventoryReservations
+        expr: commerceflow_inventory_reservations_stale > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stock is held by reservations no saga will finish"
+          description: >-
+            {{ $value }} reservation(s) have been holding stock for longer than the configured
+            window. Check each order's saga before releasing — one parked at the payment step may
+            already have been charged. Runbook section 1b.
+
+      # A saga that unwound itself is working as designed, but it is still a customer who did not
+      # get their order, so a steady stream of them means Inventory is unreliable.
+      - alert: SagasAbandoningThemselves
+        expr: rate(commerceflow_saga_abandoned_total[15m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Orders are being cancelled because the reserve step went unanswered"
+          description: >-
+            The orchestrator is unwinding sagas whose reserve step never replied. Nothing was
+            charged, but these are lost orders. Check Inventory Service and its command topic.
+
+      # Re-sends are the orchestrator doing its job, so this fires on a rate rather than a count:
+      # occasional retries are healthy, a sustained stream of them is a participant in trouble.
+      - alert: SagaStepsBeingResent
+        expr: rate(commerceflow_saga_step_resent_total[10m]) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Saga commands are being re-sent repeatedly"
+          description: >-
+            Steps are not being answered within their deadline. A participant is slow or down;
+            check consumer lag on the command topics before it turns into parked sagas.
+
+      - alert: KafkaConsumerLag
+        expr: sum by (client_id) (kafka_consumer_fetch_manager_records_lag) > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Consumer {{ $labels.client_id }} is more than 1000 records behind"
+
+  - name: commerceflow-resources
+    rules:
+      - alert: JvmHeapPressure
+        expr: |
+          sum by (service) (jvm_memory_used_bytes{area="heap"})
+            / sum by (service) (jvm_memory_max_bytes{area="heap"}) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }} heap is above 90%"
+
+      - alert: DatabaseConnectionPoolExhausted
+        expr: hikaricp_connections_pending > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }} has threads waiting for a database connection"

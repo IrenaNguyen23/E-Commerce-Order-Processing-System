@@ -1,0 +1,14 @@
+.git
+.github
+.idea
+.vscode
+**/target
+!**/target/*.jar
+docs
+k8s
+infrastructure/grafana/data
+*.md
+!README.md
+.env
+.env.*
+docker-compose*.yml

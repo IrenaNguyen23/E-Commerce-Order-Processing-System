@@ -1,0 +1,116 @@
+# =====================================================================================
+# Fast feedback on a pull request.
+#
+# Deliberately cheap and deliberately not a duplicate of CI: this catches the things that are
+# embarrassing to find in review — a manifest that does not parse, a compose file that is
+# invalid, a dependency with a known CVE, a commit message nobody can read.
+# =====================================================================================
+name: PR validation
+
+on:
+  pull_request:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  security-events: write
+
+jobs:
+
+  compile:
+    name: Compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: "!github.event.pull_request.draft"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Compile main and test sources
+        run: mvn -B -ntp clean test-compile
+
+  manifests:
+    name: Validate manifests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate docker-compose.yml
+        run: docker compose -f docker-compose.yml config --quiet
+
+      - name: Set up kustomize
+        uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: "5.4.3"
+
+      - name: Render the Kubernetes manifests
+        run: |
+          kustomize build k8s/ > /tmp/rendered.yaml
+          echo "Rendered $(grep -c '^kind:' /tmp/rendered.yaml) objects."
+
+      - name: Validate against the Kubernetes schema
+        uses: instrumenta/kubeval-action@master
+        continue-on-error: true
+        with:
+          files: /tmp/rendered.yaml
+
+      - name: Check the placeholder secret was not filled in
+        run: |
+          # A real credential must never reach the repository: the committed Secret is a
+          # template, and it has to stay one.
+          if ! grep -q "REPLACE-ME" k8s/01-config.yaml; then
+            echo "::error file=k8s/01-config.yaml::The Secret template no longer contains its REPLACE-ME placeholders. Never commit a real credential."
+            exit 1
+          fi
+
+  dependency-review:
+    name: Dependency review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Review new dependencies
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint the Dockerfiles
+        uses: hadolint/hadolint-action@v3.1.0
+        continue-on-error: true
+        with:
+          recursive: true
+          dockerfile: "**/Dockerfile"
+          failure-threshold: error
+
+      - name: Check for trailing whitespace and tabs in YAML
+        run: |
+          FOUND=0
+          while IFS= read -r file; do
+            if grep -nP "[ \t]+$" "$file" >/dev/null 2>&1; then
+              echo "::warning file=${file}::trailing whitespace"
+              FOUND=1
+            fi
+            if grep -nP "^\t" "$file" >/dev/null 2>&1; then
+              echo "::error file=${file}::tabs are not valid YAML indentation"
+              FOUND=2
+            fi
+          done < <(git ls-files '*.yml' '*.yaml')
+          [ "$FOUND" -lt 2 ] || exit 1

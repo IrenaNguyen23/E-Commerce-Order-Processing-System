@@ -1,0 +1,439 @@
+# =====================================================================================
+# CommerceFlow — full local stack.
+#
+#   docker compose up -d --build
+#   docker compose logs -f order-service
+#   docker compose down -v          # also drops the data volumes
+#
+# Every service listens on 8080 inside its container (docker/standards.md) and is published on
+# the port the README documents. Containers are named commerceflow-{service}.
+#
+# Start order is enforced with health-gated `depends_on`, so a service never starts against a
+# database that has not run its init scripts or a broker that is not accepting connections.
+# =====================================================================================
+
+name: commerceflow
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  networks: [commerceflow]
+  environment: &service-env
+    SPRING_PROFILES_ACTIVE: docker
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: 5432
+    POSTGRES_USER: commerceflow
+    POSTGRES_PASSWORD: commerceflow
+    REDIS_HOST: redis
+    REDIS_PORT: 6379
+    KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    # Local development key. Every deployed environment MUST override this with a secret.
+    JWT_SECRET: commerceflow-local-development-secret-change-me-before-production
+    JWT_ISSUER: commerceflow
+    GATEWAY_PUBLIC_URL: http://localhost:8080
+    TRACING_SAMPLE_RATE: "1.0"
+    JAVA_OPTS: "-XX:MaxRAMPercentage=75.0 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError"
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+
+  # ------------------------------------------------------------------ infrastructure
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: commerceflow-postgres
+    restart: unless-stopped
+    networks: [commerceflow]
+    environment:
+      POSTGRES_USER: commerceflow
+      POSTGRES_PASSWORD: commerceflow
+      POSTGRES_DB: commerceflow
+      # Speeds up first start; the data volume is disposable in local development.
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U commerceflow -d commerceflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: commerceflow-redis
+    restart: unless-stopped
+    networks: [commerceflow]
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+      - ./infrastructure/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  kafka:
+    # KRaft mode: no ZooKeeper (one less moving part, and the deprecation is already behind us).
+    image: confluentinc/cp-kafka:7.7.1
+    container_name: commerceflow-kafka
+    restart: unless-stopped
+    networks: [commerceflow]
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:29093,EXTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_NUM_PARTITIONS: 3
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  # Creates the saga topics with a deliberate partition count instead of leaving them to
+  # auto-creation with broker defaults. Exits once done.
+  kafka-init:
+    image: confluentinc/cp-kafka:7.7.1
+    container_name: commerceflow-kafka-init
+    networks: [commerceflow]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      TOPIC_PARTITIONS: "3"
+      TOPIC_REPLICATION_FACTOR: "1"
+    entrypoint: ["/bin/bash", "/scripts/create-topics.sh"]
+    volumes:
+      - ./infrastructure/kafka/create-topics.sh:/scripts/create-topics.sh:ro
+    restart: "no"
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: commerceflow-kafka-ui
+    restart: unless-stopped
+    networks: [commerceflow]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: commerceflow
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
+
+  # ------------------------------------------------------------------ application services
+
+  auth-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/auth-service/Dockerfile
+    image: commerceflow/auth-service:1.0.0
+    container_name: commerceflow-auth
+    ports:
+      - "8081:8080"
+    environment:
+      <<: *service-env
+      POSTGRES_DB: commerceflow_auth
+      COMMERCEFLOW_BOOTSTRAP_ADMIN_ENABLED: "true"
+      COMMERCEFLOW_BOOTSTRAP_ADMIN_EMAIL: admin@commerceflow.io
+      COMMERCEFLOW_BOOTSTRAP_ADMIN_PASSWORD: ChangeMe-Admin-2026
+      # Where reset and verification links point. Must be the storefront, not the API — and
+      # must change the moment the frontend is deployed on its own host.
+      WEB_PUBLIC_URL: "${WEB_PUBLIC_URL:-http://localhost:3001}"
+      # Off so the demo works with no mail server. TURN THIS ON IN PRODUCTION: off, anyone can
+      # register with someone else's address and receive their order confirmations.
+      REQUIRE_VERIFIED_EMAIL: "${REQUIRE_VERIFIED_EMAIL:-false}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/actuator/health/liveness"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  inventory-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/inventory-service/Dockerfile
+    image: commerceflow/inventory-service:1.0.0
+    container_name: commerceflow-inventory
+    ports:
+      - "8083:8080"
+    environment:
+      <<: *service-env
+      POSTGRES_DB: commerceflow_inventory
+      # Demo catalogue: twelve extra products so the storefront has a second page, six
+      # categories, a sold-out item, a low-stock item and a deactivated one. Local only —
+      # k8s/01-config.yaml deliberately leaves this off.
+      COMMERCEFLOW_BOOTSTRAP_DEMO_CATALOGUE_ENABLED: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/actuator/health/liveness"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  order-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/order-service/Dockerfile
+    image: commerceflow/order-service:1.0.0
+    container_name: commerceflow-order
+    ports:
+      - "8082:8080"
+    environment:
+      <<: *service-env
+      POSTGRES_DB: commerceflow_order
+      INVENTORY_SERVICE_URL: http://inventory-service:8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      # Pricing a basket is the one synchronous hop, so the catalogue must be up first.
+      inventory-service:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/actuator/health/liveness"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  payment-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/payment-service/Dockerfile
+    image: commerceflow/payment-service:1.0.0
+    container_name: commerceflow-payment
+    ports:
+      - "8084:8080"
+    environment:
+      <<: *service-env
+      POSTGRES_DB: commerceflow_payment
+      # SIMULATED by default so the stack needs no Stripe account. With STRIPE, both keys are
+      # required and the service refuses to start without them.
+      PAYMENT_GATEWAY: "${PAYMENT_GATEWAY:-SIMULATED}"
+      STRIPE_SECRET_KEY: "${STRIPE_SECRET_KEY:-}"
+      STRIPE_WEBHOOK_SECRET: "${STRIPE_WEBHOOK_SECRET:-}"
+      # Orders of 10 000 EUR or more are declined, which makes the compensation path of the
+      # saga reproducible without having to break anything.
+      PAYMENT_DECLINE_THRESHOLD: "10000.00"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/actuator/health/liveness"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  notification-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/notification-service/Dockerfile
+    image: commerceflow/notification-service:1.0.0
+    container_name: commerceflow-notification
+    ports:
+      - "8085:8080"
+    environment:
+      <<: *service-env
+      POSTGRES_DB: commerceflow_notification
+      # Real email is off in the demo stack: it has to run for someone with no mail server and
+      # no credentials. Point these at Mailtrap or any SMTP host and flip the flag to send for
+      # real — nothing else changes, the saga does not know the difference.
+      NOTIFICATION_EMAIL_ENABLED: "${NOTIFICATION_EMAIL_ENABLED:-false}"
+      SMTP_HOST: "${SMTP_HOST:-}"
+      SMTP_PORT: "${SMTP_PORT:-587}"
+      SMTP_USERNAME: "${SMTP_USERNAME:-}"
+      SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+      NOTIFICATION_EMAIL_FROM: "${NOTIFICATION_EMAIL_FROM:-no-reply@commerceflow.io}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/actuator/health/liveness"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  api-gateway:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: gateway/spring-cloud-gateway/Dockerfile
+    image: commerceflow/api-gateway:1.0.0
+    container_name: commerceflow-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      <<: *service-env
+      AUTH_SERVICE_URL: http://auth-service:8080
+      ORDER_SERVICE_URL: http://order-service:8080
+      INVENTORY_SERVICE_URL: http://inventory-service:8080
+      PAYMENT_SERVICE_URL: http://payment-service:8080
+      NOTIFICATION_SERVICE_URL: http://notification-service:8080
+    depends_on:
+      redis:
+        condition: service_healthy
+      auth-service:
+        condition: service_started
+      order-service:
+        condition: service_started
+      inventory-service:
+        condition: service_started
+      payment-service:
+        condition: service_started
+      notification-service:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/actuator/health/liveness"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 45s
+
+  # ------------------------------------------------------------------ web
+
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Empty: the browser calls a relative /api, which nginx proxies to the gateway. Same
+        # origin in every environment means no CORS anywhere.
+        VITE_API_BASE_URL: ""
+        VITE_APP_NAME: CommerceFlow
+        # Set alongside PAYMENT_GATEWAY=STRIPE. Empty means the demo acquirer, and the payment
+        # form on the order screen is skipped rather than mounted against nothing.
+        VITE_STRIPE_PUBLISHABLE_KEY: "${STRIPE_PUBLISHABLE_KEY:-}"
+    image: commerceflow/web:1.0.0
+    container_name: commerceflow-web
+    restart: unless-stopped
+    networks: [commerceflow]
+    ports:
+      - "3001:8080"
+    environment:
+      GATEWAY_URL: http://api-gateway:8080
+    depends_on:
+      api-gateway:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ------------------------------------------------------------------ observability
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: commerceflow-prometheus
+    restart: unless-stopped
+    networks: [commerceflow]
+    ports:
+      - "9090:9090"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infrastructure/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:11.2.2
+    container_name: commerceflow-grafana
+    restart: unless-stopped
+    networks: [commerceflow]
+    depends_on: [prometheus]
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: ""
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./infrastructure/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infrastructure/grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+networks:
+  commerceflow:
+    name: commerceflow
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  kafka-data:
+  prometheus-data:
+  grafana-data:

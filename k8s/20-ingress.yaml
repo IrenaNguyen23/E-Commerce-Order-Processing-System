@@ -1,0 +1,46 @@
+# =====================================================================================
+# External entry point.
+#
+# Exactly one route into the cluster, and it goes to the gateway. Nothing else is exposed:
+# the services are ClusterIP only, which is what makes the gateway's JWT verification and rate
+# limiting unavoidable rather than merely conventional.
+#
+# Written for the ingress-nginx controller; swap the annotations for your own controller.
+# =====================================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: commerceflow
+  namespace: commerceflow
+  labels:
+    app.kubernetes.io/part-of: commerceflow
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "2m"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    # A coarse edge limit; the fine-grained per-user limits live in the gateway, where the
+    # identity is actually known.
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "3"
+    nginx.ingress.kubernetes.io/enable-cors: "false"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.commerceflow.io
+      secretName: commerceflow-tls
+  rules:
+    - host: api.commerceflow.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port:
+                  number: 8080

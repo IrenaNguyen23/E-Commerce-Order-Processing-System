@@ -1,0 +1,150 @@
+server:
+  port: ${SERVER_PORT:8081}
+  shutdown: graceful
+  error:
+    include-message: never
+    include-stacktrace: never
+    whitelabel:
+      enabled: false
+  tomcat:
+    threads:
+      max: 200
+    max-http-form-post-size: 256KB
+
+spring:
+  application:
+    name: auth-service
+
+  config:
+    import: classpath:commerceflow-kafka.yml
+
+  main:
+    banner-mode: "off"
+
+  threads:
+    virtual:
+      enabled: ${VIRTUAL_THREADS_ENABLED:true}
+
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+  datasource:
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:commerceflow_auth}
+    username: ${POSTGRES_USER:commerceflow}
+    password: ${POSTGRES_PASSWORD:commerceflow}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      pool-name: auth-pool
+      maximum-pool-size: ${DB_POOL_SIZE:15}
+      minimum-idle: 2
+      connection-timeout: 10000
+      idle-timeout: 300000
+      max-lifetime: 900000
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      # Flyway owns the schema (ADR-007); Hibernate only verifies that the mapping matches it.
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+          batch_size: 50
+        order_inserts: true
+        order_updates: true
+        query:
+          in_clause_parameter_padding: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+    validate-on-migrate: true
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 2s
+      lettuce:
+        pool:
+          enabled: true
+          max-active: 16
+          max-idle: 8
+          min-idle: 1
+
+  kafka:
+    consumer:
+      group-id: auth-service
+
+commerceflow:
+  auth:
+    # Where the storefront lives. Reset and verification links must land on a page that can
+    # take a new password — not on the API. With the frontend on its own host these differ.
+    web-base-url: ${WEB_PUBLIC_URL:http://localhost:3001}
+    # Off for the demo stack, which has to work with no mail server at all.
+    # TURN THIS ON IN PRODUCTION: off, anyone can register with someone else's address.
+    require-verified-email: ${REQUIRE_VERIFIED_EMAIL:false}
+    verification-token-retention: ${VERIFICATION_TOKEN_RETENTION:7d}
+  security:
+    jwt:
+      # MUST be overridden in every deployed environment (Kubernetes secret / JWT_SECRET env var).
+      secret: ${JWT_SECRET:commerceflow-local-development-secret-change-me-before-production}
+      issuer: ${JWT_ISSUER:commerceflow}
+      access-token-ttl: ${JWT_ACCESS_TTL:15m}
+      refresh-token-ttl: ${JWT_REFRESH_TTL:7d}
+      clock-skew: 30s
+  outbox:
+    enabled: true
+    poll-interval-ms: 1000
+    batch-size: 100
+    max-attempts: 10
+  openapi:
+    public-url: ${GATEWAY_PUBLIC_URL:http://localhost:8080}
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+    tags-sorter: alpha
+    display-request-duration: true
+  default-produces-media-type: application/json
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: when_authorized
+      group:
+        readiness:
+          include: readinessState,db,redis
+  metrics:
+    tags:
+      application: ${spring.application.name}
+  observations:
+    key-values:
+      application: ${spring.application.name}
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLE_RATE:0.1}
+  otlp:
+    tracing:
+      endpoint: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:http://localhost:4318/v1/traces}
+  info:
+    env:
+      enabled: true
+
+info:
+  app:
+    name: ${spring.application.name}
+    description: CommerceFlow identity provider
+    version: 1.0.0

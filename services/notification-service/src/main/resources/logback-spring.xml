@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration scan="false">
+    <!-- All logging behaviour lives in commerceflow-common so every service logs identically. -->
+    <include resource="logback-commerceflow.xml"/>
+</configuration>

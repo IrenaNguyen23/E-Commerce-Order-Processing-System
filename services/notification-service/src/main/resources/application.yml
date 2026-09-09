@@ -1,0 +1,178 @@
+server:
+  port: ${SERVER_PORT:8085}
+  shutdown: graceful
+  error:
+    include-message: never
+    include-stacktrace: never
+    whitelabel:
+      enabled: false
+  tomcat:
+    threads:
+      max: 200
+
+spring:
+  application:
+    name: notification-service
+
+  config:
+    import: classpath:commerceflow-kafka.yml
+
+  main:
+    banner-mode: "off"
+
+  threads:
+    virtual:
+      enabled: ${VIRTUAL_THREADS_ENABLED:true}
+
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+  datasource:
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:commerceflow_notification}
+    username: ${POSTGRES_USER:commerceflow}
+    password: ${POSTGRES_PASSWORD:commerceflow}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      pool-name: notification-pool
+      maximum-pool-size: ${DB_POOL_SIZE:15}
+      minimum-idle: 2
+      connection-timeout: 10000
+      idle-timeout: 300000
+      max-lifetime: 900000
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      # Flyway owns the schema (ADR-007); Hibernate only verifies the mapping against it.
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+          batch_size: 50
+        order_inserts: true
+        order_updates: true
+        query:
+          in_clause_parameter_padding: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+    validate-on-migrate: true
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 2s
+      lettuce:
+        pool:
+          enabled: true
+          max-active: 16
+          max-idle: 8
+          min-idle: 1
+
+  kafka:
+    consumer:
+      group-id: notification-service
+
+  mail:
+    # Unset by default: with no host the auto-configuration still starts, and delivery stays
+    # switched off below, so the stack runs end to end with no mail server and no credentials.
+    host: ${SMTP_HOST:}
+    port: ${SMTP_PORT:587}
+    username: ${SMTP_USERNAME:}
+    password: ${SMTP_PASSWORD:}
+    properties:
+      mail:
+        smtp:
+          auth: ${SMTP_AUTH:true}
+          starttls:
+            enable: ${SMTP_STARTTLS:true}
+          # Deliberately short. Delivery runs inside the transaction that records the
+          # notification, so a hanging mail server must fail fast rather than hold a database
+          # connection. A slow SMTP host should cost undelivered mail, not stuck orders.
+          connectiontimeout: 5000
+          timeout: 5000
+          writetimeout: 5000
+
+commerceflow:
+  security:
+    jwt:
+      # Every service verifies tokens with the same key; MUST be injected from a secret.
+      secret: ${JWT_SECRET:commerceflow-local-development-secret-change-me-before-production}
+      issuer: ${JWT_ISSUER:commerceflow}
+      access-token-ttl: ${JWT_ACCESS_TTL:15m}
+      refresh-token-ttl: ${JWT_REFRESH_TTL:7d}
+      clock-skew: 30s
+  outbox:
+    enabled: true
+    poll-interval-ms: ${OUTBOX_POLL_INTERVAL_MS:1000}
+    batch-size: 100
+    max-attempts: 10
+    retention: 7d
+  idempotency:
+    cleanup-enabled: true
+    retention: 7d
+  openapi:
+    public-url: ${GATEWAY_PUBLIC_URL:http://localhost:8080}
+  notification:
+    email:
+      # Turn on once SMTP_HOST and credentials are set. Off means every message goes to the
+      # structured log instead, and every flow still completes.
+      enabled: ${NOTIFICATION_EMAIL_ENABLED:false}
+      from: ${NOTIFICATION_EMAIL_FROM:no-reply@commerceflow.io}
+      from-name: ${NOTIFICATION_EMAIL_FROM_NAME:CommerceFlow}
+      reply-to: ${NOTIFICATION_EMAIL_REPLY_TO:}
+    # Channels are pluggable; the log channel is the default so the platform runs without
+    # any third-party credentials. Swap in an SMTP or SMS adapter per environment.
+    default-channel: ${NOTIFICATION_DEFAULT_CHANNEL:EMAIL}
+    sender: ${NOTIFICATION_SENDER:no-reply@commerceflow.io}
+    max-retries: ${NOTIFICATION_MAX_RETRIES:3}
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+    tags-sorter: alpha
+    display-request-duration: true
+  default-produces-media-type: application/json
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: when_authorized
+      group:
+        readiness:
+          include: readinessState,db,redis
+  metrics:
+    tags:
+      application: ${spring.application.name}
+  observations:
+    key-values:
+      application: ${spring.application.name}
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLE_RATE:0.1}
+  otlp:
+    tracing:
+      endpoint: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:http://localhost:4318/v1/traces}
+  info:
+    env:
+      enabled: true
+
+info:
+  app:
+    name: ${spring.application.name}
+    description: CommerceFlow customer notifications
+    version: 1.0.0

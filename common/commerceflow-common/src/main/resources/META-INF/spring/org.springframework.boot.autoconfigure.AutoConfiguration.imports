@@ -1,0 +1,7 @@
+com.commerceflow.common.autoconfigure.CommonJacksonAutoConfiguration
+com.commerceflow.common.autoconfigure.CommonWebAutoConfiguration
+com.commerceflow.common.autoconfigure.CommonSecurityAutoConfiguration
+com.commerceflow.common.autoconfigure.CommonKafkaAutoConfiguration
+com.commerceflow.common.autoconfigure.CommonIdempotencyAutoConfiguration
+com.commerceflow.common.autoconfigure.CommonOutboxAutoConfiguration
+com.commerceflow.common.autoconfigure.CommonAuditAutoConfiguration

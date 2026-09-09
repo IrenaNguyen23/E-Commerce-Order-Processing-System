@@ -1,0 +1,69 @@
+# =====================================================================================
+# Shared, non-secret configuration.
+#
+# Everything here is identical for every service; the per-service bits (database name, the
+# downstream URLs the gateway needs) live in the individual workload manifests.
+# =====================================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: commerceflow-config
+  namespace: commerceflow
+  labels:
+    app.kubernetes.io/part-of: commerceflow
+data:
+  SPRING_PROFILES_ACTIVE: "kubernetes"
+
+  POSTGRES_HOST: "postgres"
+  POSTGRES_PORT: "5432"
+
+  REDIS_HOST: "redis"
+  REDIS_PORT: "6379"
+
+  KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+
+  JWT_ISSUER: "commerceflow"
+  JWT_ACCESS_TTL: "15m"
+  JWT_REFRESH_TTL: "7d"
+
+  GATEWAY_PUBLIC_URL: "https://api.commerceflow.io"
+  CORS_ALLOWED_ORIGINS: "https://commerceflow.io,https://www.commerceflow.io"
+
+  # Sampling is a cost decision: 10% is enough to characterise latency, and a stuck saga is
+  # found through the correlation id in the logs rather than by sampling more traces.
+  TRACING_SAMPLE_RATE: "0.1"
+  OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://otel-collector.observability:4318/v1/traces"
+
+  DB_POOL_SIZE: "15"
+  OUTBOX_POLL_INTERVAL_MS: "1000"
+
+  JAVA_OPTS: "-XX:MaxRAMPercentage=75.0 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp"
+---
+# =====================================================================================
+# Secrets.
+#
+# Committed as a template with placeholder values ONLY. Replace it in every real environment
+# with a Sealed Secret, an External Secret backed by a vault, or `kubectl create secret`:
+#
+#   kubectl -n commerceflow create secret generic commerceflow-secrets \
+#     --from-literal=JWT_SECRET="$(openssl rand -base64 48)" \
+#     --from-literal=POSTGRES_USER=commerceflow \
+#     --from-literal=POSTGRES_PASSWORD="$(openssl rand -base64 24)" \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+# The JWT secret must be at least 32 bytes: Auth Service signs with HS256 and every other
+# service verifies with the same key, so rotating it invalidates all live sessions by design.
+# =====================================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: commerceflow-secrets
+  namespace: commerceflow
+  labels:
+    app.kubernetes.io/part-of: commerceflow
+type: Opaque
+stringData:
+  JWT_SECRET: "REPLACE-ME-with-at-least-32-bytes-of-random-secret"
+  POSTGRES_USER: "commerceflow"
+  POSTGRES_PASSWORD: "REPLACE-ME"
+  REDIS_PASSWORD: ""

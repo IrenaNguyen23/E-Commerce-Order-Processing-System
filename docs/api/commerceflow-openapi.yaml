@@ -1,0 +1,2253 @@
+# =====================================================================================
+# CommerceFlow — platform API, as seen through the gateway.
+#
+# This document is the reviewed contract: it is committed, versioned and changed on purpose.
+# Each service additionally publishes a generated specification at /v3/api-docs (springdoc),
+# aggregated in the gateway's Swagger UI at http://localhost:8080/swagger-ui.html, and
+# `scripts/export-openapi.sh` exports those live documents for diffing against this one.
+#
+# Endpoint set follows .github/docs/contracts/apis.md; the additional endpoints are the ones
+# ADR-001 requires (refresh, logout) plus the read operations the flows above imply.
+# =====================================================================================
+openapi: 3.0.3
+
+info:
+  title: CommerceFlow API
+  version: 1.0.0
+  description: |
+    Microservices-based e-commerce order processing.
+
+    Placing an order is **asynchronous**. `POST /api/orders` returns `201` with status `CREATED`
+    as soon as the order is accepted and the orchestrator has been started; stock
+    reservation, payment and notification then run over Kafka. Poll `GET /api/orders/{id}` to
+    follow it — the status walks
+    `CREATED → INVENTORY_RESERVED → PAID → COMPLETED`, or moves to `CANCELLED` with
+    `failedStep` and `failureReason` telling you where and why it stopped.
+
+    Every response is wrapped in a uniform envelope: `ApiResponse` on success, `ErrorResponse`
+    on failure. Both carry the `correlationId`, which is the id to quote in a support request —
+    it stitches the whole saga together in the logs.
+  contact:
+    name: CommerceFlow Platform Team
+    email: platform@commerceflow.io
+  license:
+    name: Proprietary
+
+servers:
+  - url: http://localhost:8080
+    description: Local API Gateway (docker compose)
+  - url: https://api.commerceflow.io
+    description: Production
+
+tags:
+  - name: Authentication
+    description: Registration, login and token lifecycle
+  - name: Catalogue
+    description: Products and stock levels
+  - name: Orders
+    description: Placing and tracking orders
+  - name: Payments
+    description: Charging customers and inspecting payment outcomes
+  - name: Notifications
+    description: Delivery history
+  - name: Accounts
+    description: Administering customer accounts, and erasing them
+  - name: Audit
+    description: What operators did, and when
+  - name: Returns
+    description: Sending goods back, and getting the money back
+
+security:
+  - bearerAuth: []
+
+paths:
+
+  # ------------------------------------------------------------------ authentication
+  /api/auth/register:
+    post:
+      tags: [Authentication]
+      summary: Register a new customer account
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RegisterRequest" }
+      responses:
+        "201":
+          description: Account created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/User" }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "409":
+          description: The address is already registered (`EMAIL_ALREADY_REGISTERED`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/auth/login:
+    post:
+      tags: [Authentication]
+      summary: Exchange credentials for an access and refresh token pair
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LoginRequest" }
+      responses:
+        "200":
+          description: Token pair issued
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/AuthTokens" }
+        "401":
+          description: |
+            `INVALID_CREDENTIALS`. Returned identically for an unknown address and a wrong
+            password, so the endpoint cannot be used to enumerate registered customers.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "403":
+          description: The account is disabled (`ACCOUNT_DISABLED`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/auth/refresh:
+    post:
+      tags: [Authentication]
+      summary: Rotate a refresh token into a fresh token pair
+      description: |
+        Refresh tokens are single use. Presenting one that has already been rotated is treated
+        as a compromise indicator and revokes **every** live session of the account.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        "200":
+          description: A new token pair; the presented token is now revoked
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/AuthTokens" }
+        "401":
+          description: "`REFRESH_TOKEN_INVALID` or `TOKEN_EXPIRED`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /api/auth/logout:
+    post:
+      tags: [Authentication]
+      summary: Revoke the current access token and every refresh token of the account
+      description: |
+        The access token is added to a Redis deny-list for the remainder of its natural life,
+        which is the only way to end a self-contained token's session early.
+      responses:
+        "200":
+          description: Logged out
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/auth/me:
+    get:
+      tags: [Authentication]
+      summary: Return the account behind the current access token
+      responses:
+        "200":
+          description: The account
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/User" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/auth/forgot-password:
+    post:
+      tags: [Authentication]
+      summary: Request a password reset link
+      description: |
+        Answers `202` for a registered address, an unregistered one and a disabled account
+        alike. An endpoint that responded differently would let anyone check which addresses
+        have accounts, so the message says *if an account exists* rather than claiming an email
+        was sent.
+
+        The emailed token is single use and expires in 30 minutes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email, example: ada@commerceflow.io }
+      responses:
+        "202":
+          description: Request accepted, whether or not an account exists
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponse" }
+
+  /api/auth/reset-password:
+    post:
+      tags: [Authentication]
+      summary: Set a new password using an emailed token
+      description: |
+        Single use. Completing a reset **revokes every refresh token the account holds** — a
+        reset is what someone does when they believe their account is compromised, and leaving
+        the intruder's session alive would defeat the point. It also marks the address verified,
+        since redeeming the token proves the mailbox was reachable.
+
+        Unknown, expired and already-used tokens all return the same `400`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, newPassword]
+              properties:
+                token: { type: string, description: The token from the emailed link }
+                newPassword:
+                  type: string
+                  minLength: 8
+                  maxLength: 72
+                  description: At least 8 characters with one letter and one digit
+                  example: N3w-pass-2026
+      responses:
+        "200":
+          description: Password changed; every session was signed out
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponse" }
+        "400":
+          description: The link is unknown, already used, or expired
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /api/auth/verify-email:
+    post:
+      tags: [Authentication]
+      summary: Confirm an email address
+      description: |
+        Redeems the token sent at registration. Clicking twice is not an error.
+
+        Whether an unverified account may sign in is a deployment switch
+        (`commerceflow.auth.require-verified-email`), off in the demo stack and expected to be
+        on in production.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string, description: The token from the emailed link }
+      responses:
+        "200":
+          description: Address confirmed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponse" }
+        "400":
+          description: The link is unknown, already used, or expired
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /api/auth/resend-verification:
+    post:
+      tags: [Authentication]
+      summary: Ask for another confirmation link
+      description: |
+        Answers identically for an unknown address, an already-verified one and one that needs
+        confirming, for the same reason as `forgot-password`. Issuing a new link invalidates any
+        previous one.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email, example: ada@commerceflow.io }
+      responses:
+        "202":
+          description: Request accepted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponse" }
+
+  # ------------------------------------------------------------------ account administration
+  /api/users:
+    get:
+      tags: [Accounts]
+      summary: List accounts
+      description: >-
+        Administrator only. Paged, with optional filters over email and name, role, and whether
+        the account can sign in.
+      parameters:
+        - { name: search, in: query, schema: { type: string }, description: Free text over email and name }
+        - { name: role, in: query, schema: { type: string, enum: [CUSTOMER, ADMIN] } }
+        - { name: enabled, in: query, schema: { type: boolean } }
+        - { name: page, in: query, schema: { type: integer, default: 0, minimum: 0 } }
+        - { name: size, in: query, schema: { type: integer, default: 20, minimum: 1, maximum: 100 } }
+        - { name: sortBy, in: query, schema: { type: string, default: createdAt } }
+        - { name: direction, in: query, schema: { type: string, enum: [asc, desc], default: desc } }
+      responses:
+        "200": { description: A page of accounts }
+
+  /api/users/{id}:
+    get:
+      tags: [Accounts]
+      summary: Fetch one account
+      description: Administrator only.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: The account }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Accounts]
+      summary: Enable, disable, or change the roles of an account
+      description: |
+        Administrator only. Omitted fields are left alone.
+
+        Disabling **signs the account out everywhere** — every refresh token is revoked, so
+        "disabled" means disabled now rather than whenever the token happened to expire.
+
+        Two changes are refused: locking yourself out, and removing the last enabled
+        administrator. Both leave a platform that can only be recovered from a database console.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enabled: { type: boolean }
+                roles:
+                  type: array
+                  items: { type: string, enum: [CUSTOMER, ADMIN] }
+      responses:
+        "200": { description: The updated account }
+        "409": { $ref: "#/components/responses/Conflict" }
+    delete:
+      tags: [Accounts]
+      summary: Erase an account
+      description: |
+        Your own, or anybody's if you are an administrator. Somebody else's returns `404` rather
+        than `403`.
+
+        **Anonymises rather than deletes.** Orders reference the account and orders are financial
+        records that have to survive — removing the row would take the money with it. The address
+        becomes a non-routable placeholder in the reserved `.invalid` domain, the name and phone
+        go, every session is revoked, and the account can never be signed into again. Saved
+        addresses are deleted outright, because nothing else needs them.
+
+        Order Service and Inventory Service are told over `user.erased` and scrub their own copies
+        — the name on the order snapshot, the author of a review. Eventually consistent by design:
+        erasure has a legal deadline measured in weeks, not the seconds a payment does.
+
+        Refused with `409` for the last administrator who can still sign in. **There is no undo**;
+        anonymisation destroys what would be needed to reverse it, which is the point.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "204": { description: Erased }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/users/{id}/unlock-signin:
+    post:
+      tags: [Accounts]
+      summary: Release a sign-in lock
+      description: |
+        Administrator only. Five wrong passwords lock an account for fifteen minutes. The lock
+        releases itself, so this exists for the case where waiting is the wrong answer: somebody
+        who mistyped on a phone keyboard and is on the telephone now.
+
+        It does **not** touch whether the account is enabled. A lock is a temporary consequence of
+        traffic; enabled is a decision about the account. Conflating them would let anyone shut a
+        customer out permanently by typing a wrong password often enough.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: The lock is released; the failure counter is reset }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ------------------------------------------------------------------ audit trail
+  #
+  # One path per service, and that is the contract rather than an accident. The audit log is
+  # deliberately not centralised: each service writes its own rows into its own database, in the
+  # same transaction as the change they describe. A shared audit table would be a synchronous
+  # dependency on the write path of every service.
+  #
+  # {service} is one of: auth, orders, inventory, payments, notifications.
+  /api/audit/{service}:
+    get:
+      tags: [Audit]
+      summary: Search one service's audit trail
+      description: |
+        Administrator only, and read only. Newest first. Every filter is optional; with none, it
+        is the most recent activity in that service.
+
+        **Paged by position, not by page number.** The response carries `nextBeforeAt` and
+        `nextBeforeId`; send them back as `beforeAt` and `beforeId` for the following page.
+        Offsets are not offered because the back office merges this stream with the same stream
+        from four other services, and page 3 of one service does not cover the same span of time
+        as page 3 of another.
+
+        There is no total count. Producing one would mean a second query over a table with a
+        two-year retention on every request, for a number nobody acts on.
+      parameters:
+        - name: service
+          in: path
+          required: true
+          schema: { type: string, enum: [auth, orders, inventory, payments, notifications] }
+        - { name: actor, in: query, schema: { type: string },
+            description: Part of the acting account's email address }
+        - { name: action, in: query, schema: { type: string },
+            description: "Exact action, e.g. ROLES_CHANGED" }
+        - { name: targetType, in: query, schema: { type: string },
+            description: "ORDER, PRODUCT, USER, COUPON, REVIEW, WAREHOUSE" }
+        - { name: targetId, in: query, schema: { type: string },
+            description: Everything that ever happened to one thing }
+        - { name: correlationId, in: query, schema: { type: string },
+            description: One customer action, across every service that recorded it }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: beforeAt, in: query, schema: { type: string, format: date-time },
+            description: Position to continue from — nextBeforeAt of the previous page }
+        - { name: beforeId, in: query, schema: { type: string, format: uuid },
+            description: Tiebreak for entries sharing beforeAt — nextBeforeId }
+        - { name: size, in: query, schema: { type: integer, default: 50, minimum: 1, maximum: 200 } }
+      responses:
+        "200":
+          description: A page of entries, newest first
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuditSlice" }
+        "403": { description: Not an administrator }
+
+  /api/audit/{service}/actions:
+    get:
+      tags: [Audit]
+      summary: Actions one service has recorded
+      description: >-
+        Administrator only. What is actually in that service's table, so a filter can offer real
+        values rather than a hard-coded list that drifts every time a new operation starts being
+        audited.
+      parameters:
+        - name: service
+          in: path
+          required: true
+          schema: { type: string, enum: [auth, orders, inventory, payments, notifications] }
+      responses:
+        "200":
+          description: Distinct action names, alphabetical
+          content:
+            application/json:
+              schema: { type: array, items: { type: string } }
+
+  # ------------------------------------------------------------------ catalogue
+  /api/products:
+    get:
+      tags: [Catalogue]
+      summary: Search the catalogue
+      security: []
+      parameters:
+        - { name: category, in: query, schema: { type: string }, description: Exact category match }
+        - { name: search, in: query, schema: { type: string }, description: Free text over name and SKU }
+        - { name: activeOnly, in: query, schema: { type: boolean, default: true } }
+        - { name: page, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+        - { name: size, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - name: sortBy
+          in: query
+          schema: { type: string, enum: [name, price, createdAt, sku, category], default: name }
+        - { name: direction, in: query, schema: { type: string, enum: [asc, desc], default: asc } }
+      responses:
+        "200":
+          description: A page of products
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data:
+                        allOf:
+                          - $ref: "#/components/schemas/Page"
+                          - type: object
+                            properties:
+                              content:
+                                type: array
+                                items: { $ref: "#/components/schemas/Product" }
+    post:
+      tags: [Catalogue]
+      summary: Add a product together with its opening stock
+      description: Back office only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateProductRequest" }
+      responses:
+        "201":
+          description: Product created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Product" }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: The SKU is already taken (`SKU_ALREADY_EXISTS`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /api/products/{id}:
+    get:
+      tags: [Catalogue]
+      summary: Fetch one product by id
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The product
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Product" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/products/sku/{sku}:
+    get:
+      tags: [Catalogue]
+      summary: Fetch one product by SKU
+      security: []
+      parameters:
+        - { name: sku, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The product
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Product" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/products/lookup:
+    post:
+      tags: [Catalogue]
+      summary: Batch lookup by id
+      description: |
+        Used by Order Service to price a whole basket in one call. Unknown ids are omitted from
+        the result rather than failing the request. Reads the same public data as
+        `GET /api/products`; a POST only because the id list does not belong in a URL.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [productIds]
+              properties:
+                productIds:
+                  type: array
+                  maxItems: 100
+                  items: { type: string, format: uuid }
+      responses:
+        "200":
+          description: The products that exist
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/Product" }
+
+  /api/products/{id}/stock:
+    put:
+      tags: [Catalogue]
+      summary: Correct the available stock of a product
+      description: |
+        Back office only. Only `availableQuantity` is affected — units already reserved by a
+        running order saga are never touched, because moving them would break the compensation
+        arithmetic.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quantity]
+              properties:
+                quantity: { type: integer, minimum: 0, example: 250 }
+                operation:
+                  type: string
+                  enum: [SET, INCREASE, DECREASE]
+                  default: SET
+                reason: { type: string, maxLength: 255, example: "Stock count 2026-08-26" }
+      responses:
+        "200":
+          description: Stock updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Product" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ------------------------------------------------------------------ reservations
+  /api/reservations/{orderId}/release:
+    post:
+      tags: [Catalogue]
+      summary: Release a stuck inventory hold
+      description: |
+        Back office only, and not part of the saga.
+
+        `StaleInventoryReservations` reports holds that have outlived any plausible order but
+        deliberately does not release them: from inside Inventory, a hold whose saga no longer
+        exists looks identical to one whose saga is parked mid-payment, and releasing the second
+        would put stock back on sale for an order the customer may already have paid for.
+
+        Check the order's saga first — runbook section 1b has the query and the decision table.
+
+        Returns the held units to `availableQuantity`, closes the reservation with the supplied
+        reason, and publishes `inventory.released`, so a manual release is audited exactly like a
+        commanded one.
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  maxLength: 128
+                  example: "Saga orphaned by the 2026-08-27 deploy; no payment found"
+      responses:
+        "200":
+          description: The hold was released
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          reservationId: { type: string, format: uuid }
+                          orderId: { type: string, format: uuid }
+                          status: { type: string, example: RELEASED }
+                          unitsReturned: { type: integer, example: 3 }
+                          reason: { type: string, example: RELEASED_BY_OPERATOR }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The reservation is not holding stock any more (already released, or confirmed and therefore sold)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  # ------------------------------------------------------------------ orders
+  /api/orders:
+    post:
+      tags: [Orders]
+      summary: Place an order
+      description: |
+        Persists the order and starts the saga in one transaction, then returns
+        immediately with status `CREATED`. Stock reservation and payment happen asynchronously.
+
+        Supplying `idempotencyKey` makes a retried request return the original order instead of
+        placing a second one.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateOrderRequest" }
+      responses:
+        "201":
+          description: Order accepted; the saga has started
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Order" }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: A product in the basket does not exist (`PRODUCT_NOT_FOUND`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "422":
+          description: A product is no longer for sale, or the basket mixes currencies
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "503":
+          description: The catalogue is unavailable, so the order cannot be priced
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+    get:
+      tags: [Orders]
+      summary: List orders
+      description: A customer sees their own orders; an `ADMIN` sees every order.
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [CREATED, INVENTORY_RESERVED, PAID, COMPLETED, CANCELLED]
+        - name: userId
+          in: query
+          schema: { type: string, format: uuid }
+          description: ADMIN only; ignored for customers
+        - { name: page, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+        - { name: size, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - name: sortBy
+          in: query
+          schema:
+            type: string
+            enum: [createdAt, updatedAt, totalAmount, status, orderNumber]
+            default: createdAt
+        - { name: direction, in: query, schema: { type: string, enum: [asc, desc], default: desc } }
+      responses:
+        "200":
+          description: A page of orders
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data:
+                        allOf:
+                          - $ref: "#/components/schemas/Page"
+                          - type: object
+                            properties:
+                              content:
+                                type: array
+                                items: { $ref: "#/components/schemas/Order" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/orders/{id}:
+    get:
+      tags: [Orders]
+      summary: Fetch one order
+      description: |
+        Served from the CQRS read model. A customer may only read their own orders; an unknown
+        order and a foreign order both return `404`, so the endpoint cannot be used to discover
+        which order ids exist.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The order
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Order" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/orders/{id}/cancel:
+    post:
+      tags: [Orders]
+      summary: Cancel an order
+      description: |
+        Cancels the order and unwinds whatever it had already done: a refund if it was paid for,
+        and the stock back either way.
+
+        **The order is marked `CANCELLED` immediately**, before any of the undoing. It will not be
+        fulfilled, and that is knowable right now. Whether the money has come back is the
+        *payment's* status rather than the order's — there is no `REFUNDED` order status — so poll
+        `GET /api/payments/order/{orderId}` for that; it moves to `REFUNDED` when the money is on
+        its way back.
+
+        A customer may cancel their own order; an administrator may cancel anyone's. A foreign
+        order returns `404` rather than `403`, for the same reason as `GET /api/orders/{id}`.
+
+        ### Why this can be refused
+
+        | Situation | Status | What the caller should do |
+        |---|---|---|
+        | Saga still running | `409` | Try again in a few seconds — it settles quickly |
+        | Saga parked, caller is a customer | `409` | Contact support; a human is already on it |
+        | Saga parked, caller is an administrator | `200` | Allowed, but verify the payment first |
+        | Already cancelled | `409` | Nothing to do |
+
+        The running-saga refusal is the load-bearing one. A mid-flight order has a command
+        outstanding, and cancelling into that race can issue a refund for a charge the system has
+        not finished recording.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: false
+        description: Optional. The reason is recorded and shown to the customer.
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  maxLength: 255
+                  example: Ordered the wrong size
+      responses:
+        "200":
+          description: The cancelled order. Undoing continues asynchronously.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Order" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/orders/number/{orderNumber}:
+    get:
+      tags: [Orders]
+      summary: Fetch one order by its human readable number
+      parameters:
+        - name: orderNumber
+          in: path
+          required: true
+          schema: { type: string, example: CF-20260826-000123 }
+      responses:
+        "200":
+          description: The order
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Order" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ------------------------------------------------------------------ basket
+  /api/cart:
+    get:
+      tags: [Basket]
+      summary: My basket
+      description: |
+        Priced from the live catalogue on **every** request. A basket stores product ids and
+        quantities and nothing else — a price stored on it would mean one saved on Tuesday quoting
+        Tuesday's price while the checkout charges Friday's.
+
+        A line whose product is withdrawn, out of stock, or short of the quantity asked for comes
+        back with an `issue` and is **not** removed or reduced. Quietly trimming a basket is the
+        version that feels helpful: somebody returns to buy five, is given two, and finds out from
+        the invoice.
+      responses:
+        "200":
+          description: The basket
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Cart" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    delete:
+      tags: [Basket]
+      summary: Empty my basket
+      responses:
+        "200": { description: The now empty basket }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/cart/items:
+    put:
+      tags: [Basket]
+      summary: Set the quantity of a product
+      description: |
+        **Sets** rather than adds, which is what a quantity control does. An "add" endpoint that a
+        client retries would leave the customer with four of something they asked for twice.
+        Quantity `0` removes the line.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [productId, quantity]
+              properties:
+                productId: { type: string, format: uuid }
+                quantity: { type: integer, minimum: 0 }
+      responses:
+        "200": { description: The updated basket }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Conflict" }
+
+  /api/cart/merge:
+    post:
+      tags: [Basket]
+      summary: Fold a guest basket into mine
+      description: |
+        Called once, just after signing in, with whatever was in the browser.
+
+        Where both baskets hold the same product the **larger** quantity wins rather than the sum.
+        Two on a phone and two on a laptop is almost always one intention expressed twice; of the
+        two ways to be wrong, leaving somebody with fewer than they wanted is the one they notice
+        and can fix in a click.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                type: object
+                properties:
+                  productId: { type: string, format: uuid }
+                  quantity: { type: integer, minimum: 0 }
+      responses:
+        "200": { description: The merged basket }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  # ------------------------------------------------------------------ coupons
+  /api/coupons/preview:
+    post:
+      tags: [Coupons]
+      summary: What would this code be worth?
+      description: |
+        Validates a code against a basket **without spending a redemption**. A basket page that
+        claimed one every time somebody typed a code would exhaust a limited campaign on curiosity.
+
+        The consequence is stated rather than hidden: a code can pass here and be refused at
+        checkout, because the last one went in between. That is what a limited campaign means.
+
+        The saving comes back as **two figures**. A reduction on the goods lowers the tax with it;
+        free delivery does not touch the tax at all. Collapsing them into one number is how a
+        basket page ends up disagreeing with the checkout for reasons no customer can work out.
+
+        A code that cannot be used is refused with `422` and a message naming the reason — expired,
+        not started, fully redeemed, basket too small, already used. "Invalid code" for all of them
+        leaves somebody unable to tell a typo from an expiry.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, basketAmount]
+              properties:
+                code: { type: string, maxLength: 40, example: WELCOME10 }
+                basketAmount: { type: number, description: The goods at list price }
+                shippingAmount: { type: number }
+                currency: { type: string, example: EUR }
+      responses:
+        "200":
+          description: What it is worth
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/CouponPreview" }
+        "422": { $ref: "#/components/responses/Conflict" }
+
+  /api/coupons:
+    get:
+      tags: [Coupons]
+      summary: List codes
+      description: Administrator only. Newest first.
+      parameters:
+        - { name: active, in: query, schema: { type: boolean } }
+        - { name: page, in: query, schema: { type: integer, default: 0 } }
+        - { name: size, in: query, schema: { type: integer, default: 20, maximum: 100 } }
+      responses:
+        "200": { description: A page of codes }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [Coupons]
+      summary: Create a code
+      description: |
+        Administrator only.
+
+        `value` is a **fraction** for a percentage: `0.10` is ten per cent. A fixed amount is an
+        amount in `currency`, and needs one — without it there is no way to tell whether "10 off"
+        means euros or dong.
+
+        A percentage of 1 or more is **refused rather than interpreted**. Accepting `10` and
+        guessing which was meant is the kind of convenience that eventually creates a code worth
+        ten times what somebody intended.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CouponRequest" }
+      responses:
+        "201": { description: The new code }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/coupons/{id}:
+    put:
+      tags: [Coupons]
+      summary: Edit a code
+      description: |
+        Administrator only. Everything but the code itself, which is immutable: it is printed on
+        posters and recorded as text on every order that used it, so renaming it makes all of that
+        refer to something that no longer exists.
+
+        The value, the window and the caps **are** editable on a live campaign — one doing better
+        or worse than expected gets adjusted, and refusing that sends operators to the database.
+        Changes affect the next order and nothing already placed.
+
+        Lowering `maxRedemptions` below what has already been redeemed is refused with the actual
+        number, rather than arriving as a constraint violation.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CouponRequest" }
+      responses:
+        "200": { description: The updated code }
+        "422": { $ref: "#/components/responses/Conflict" }
+    delete:
+      tags: [Coupons]
+      summary: Delete an unused code
+      description: >-
+        Administrator only. Refused with `409` once it has been redeemed — those rows are the record
+        of what the campaign cost. Switch it off instead, which stops it working immediately and
+        keeps the history.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "204": { description: Deleted }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/coupons/{id}/redemptions:
+    get:
+      tags: [Coupons]
+      summary: Who used a code
+      description: >-
+        Administrator only. `discountAmount` is what it was worth on that order, which can be less
+        than the code's face value when the basket was smaller than the discount. That figure, not
+        the value times the count, is what the campaign cost.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: Every use, most recent first }
+
+  # ------------------------------------------------------------------ delivery
+  /api/shipping/quotes:
+    get:
+      tags: [Shipping]
+      summary: Price the delivery options for a destination
+      description: |
+        Every method that can actually be offered to that country, cheapest first, priced for this
+        basket. A method with no rate is left out rather than shown and then refused on submit.
+
+        `goodsAfterDiscount` is what the customer is paying for the goods. The free-delivery
+        threshold is measured against it rather than the list price, so a coupon cannot buy free
+        delivery.
+      parameters:
+        - { name: countryCode, in: query, required: true, schema: { type: string, example: NL } }
+        - { name: itemCount, in: query, schema: { type: integer, default: 1 } }
+        - { name: goodsAfterDiscount, in: query, schema: { type: number, default: 0 } }
+        - { name: currency, in: query, schema: { type: string, default: EUR } }
+      responses:
+        "200":
+          description: Priced options
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/ShippingQuote" }
+
+  # ------------------------------------------------------------------ shipments
+  /api/orders/{orderId}/shipments:
+    get:
+      tags: [Shipments]
+      summary: Shipments for an order
+      description: |
+        Usually one. Two after a return and a redelivery. A customer sees only their own; somebody
+        else's order returns `404` rather than `403`.
+
+        Note that **a shipment status is not an order status**. An order is `COMPLETED` while its
+        parcel is `IN_TRANSIT`: the order's status is the saga's state machine, guarded so a late
+        reply cannot move it backwards, and a parcel runs on a different clock and legitimately
+        goes backwards.
+      parameters:
+        - { name: orderId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Shipments, with their full history
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [Shipments]
+      summary: Open a shipment
+      description: |
+        Administrator only, and only for an order the saga has finished with. An order still being
+        paid for has stock that is **reserved, not sold**, and dispatching against a reservation
+        means the warehouse has sent something the shop may still have to refund.
+
+        Carrier and tracking number are optional here: a warehouse usually opens the shipment when
+        it starts picking and only learns them when the parcel is handed over.
+      parameters:
+        - { name: orderId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "201": { description: The new shipment }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/shipments/{shipmentId}/events:
+    post:
+      tags: [Shipments]
+      summary: Record what has happened to a parcel
+      description: |
+        Appends to the history and moves the current state. Administrator only.
+
+        Transitions are **looser** than the order saga's on purpose: a delivered parcel can be
+        returned and a failed delivery can go back into transit, because both happen to real
+        parcels and a system that refuses to record them forces warehouse staff to lie to it. Only
+        nonsense is refused — a cancelled shipment coming back to life, a delivered one going back
+        to being picked.
+
+        Dispatch, a failed attempt, delivery and a return email the customer. Picking does not: an
+        email per internal state change teaches people to ignore mail from the shop.
+      parameters:
+        - { name: shipmentId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  enum: [PENDING, PICKING, DISPATCHED, IN_TRANSIT, ATTEMPTED, DELIVERED,
+                         RETURNED, CANCELLED]
+                note: { type: string, maxLength: 500 }
+                location: { type: string, maxLength: 150 }
+                carrier: { type: string }
+                trackingNumber: { type: string }
+                trackingUrl: { type: string }
+      responses:
+        "200": { description: The updated shipment }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  # ------------------------------------------------------------------ returns
+  #
+  # A return is a new piece of business that refers to an order, not a state of it. The order
+  # stays COMPLETED throughout — the same arrangement as a shipment, and for the same reason:
+  # orders.status is the saga's state machine and nothing in the saga sets RETURNED.
+  /api/orders/{orderId}/returnable:
+    get:
+      tags: [Returns]
+      summary: What of this order can still be sent back
+      description: >-
+        Every line with what was ordered, what an open or settled return has already claimed, and
+        what one unit gives back. Served before the customer chooses, so a form cannot offer a
+        quantity that would be refused.
+      parameters:
+        - { name: orderId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: One entry per order line
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ReturnableLine" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/orders/{orderId}/returns:
+    get:
+      tags: [Returns]
+      summary: Returns raised against one order
+      parameters:
+        - { name: orderId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Return" }
+    post:
+      tags: [Returns]
+      summary: Ask to send items back
+      description: |
+        Only for an order that has **COMPLETED**. One still being paid for is cancelled instead —
+        that unwinds the saga and puts the stock straight back, which is a different and cheaper
+        operation.
+
+        The refund is worked out and frozen now, from the prices actually charged: a line gives
+        back its `unitPrice` (which already has any coupon allocated into it) plus tax at the rate
+        frozen on the order. A catalogue change or an expiring campaign between asking and
+        refunding cannot alter what somebody gets.
+
+        Delivery is refunded only when the whole order comes back. A customer keeping one item of
+        three has still had the parcel delivered.
+
+        Refused with `409` when a line is asked for in a quantity larger than what is left after
+        earlier returns.
+      parameters:
+        - { name: orderId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateReturnRequest" }
+      responses:
+        "201":
+          description: The return, priced
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Return" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/returns/mine:
+    get:
+      tags: [Returns]
+      summary: Every return this customer has raised
+      responses:
+        "200":
+          description: Newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Return" }
+
+  /api/returns/{returnId}:
+    get:
+      tags: [Returns]
+      summary: One return
+      description: A customer sees their own; somebody else's returns 404 rather than 403.
+      parameters:
+        - { name: returnId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The return
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Return" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/returns/{returnId}/cancel:
+    post:
+      tags: [Returns]
+      summary: Call off a return
+      description: >-
+        Only while nobody has decided on it. Once it is approved the goods are on their way back,
+        and cancelling would leave a parcel arriving that nothing expects.
+      parameters:
+        - { name: returnId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Cancelled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Return" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/returns:
+    get:
+      tags: [Returns]
+      summary: The returns queue
+      description: >-
+        Administrator only. Filtered by state, oldest first — which is the order it should be
+        worked in. Without a state, everything newest first.
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [REQUESTED, APPROVED, REJECTED, RECEIVED, REFUND_PENDING, REFUNDED, CANCELLED]
+        - { name: page, in: query, schema: { type: integer, default: 0, minimum: 0 } }
+        - { name: size, in: query, schema: { type: integer, default: 20, minimum: 1, maximum: 100 } }
+      responses:
+        "200": { description: A page of returns }
+        "403": { description: Not an administrator }
+
+  /api/returns/{returnId}/approve:
+    post:
+      tags: [Returns]
+      summary: Approve a return
+      description: >-
+        Administrator only. The customer is told to send the goods back. Nothing is refunded yet —
+        money follows the goods, not the promise of them.
+      parameters:
+        - { name: returnId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReturnDecision" }
+      responses:
+        "200":
+          description: Approved
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Return" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/returns/{returnId}/reject:
+    post:
+      tags: [Returns]
+      summary: Refuse a return
+      description: >-
+        Administrator only. The note is shown to the customer and is the only place they will find
+        out why. A refusal with no reason produces a support ticket instead.
+      parameters:
+        - { name: returnId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReturnDecision" }
+      responses:
+        "200":
+          description: Refused
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Return" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/returns/{returnId}/received:
+    post:
+      tags: [Returns]
+      summary: The goods are back
+      description: |
+        Administrator only. Separate from refunding on purpose: what came back is a warehouse fact
+        and what is paid is a money decision, and one person often does the first without the
+        authority for the second.
+
+        **`restock` is required and has no default.** Not everything that comes back can be sold
+        again — a change of mind returns to the shelf, a cracked screen does not — and only the
+        person holding the box can tell. `true` sends a restock command to Inventory Service for
+        exactly the returned lines, back into the building they shipped from; `false` records the
+        units as received and written off.
+      parameters:
+        - { name: returnId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [restock]
+              properties:
+                restock: { type: boolean }
+      responses:
+        "200":
+          description: Recorded
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Return" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/returns/{returnId}/refund:
+    post:
+      tags: [Returns]
+      summary: Send the money back
+      description: |
+        Administrator only. Asks Payment Service over `return.refund.commands` and leaves the
+        return **REFUND_PENDING** until the answer arrives on `return.refunded`. There is no
+        synchronous call: the command goes into the outbox in the same transaction as the state
+        change, so the two cannot disagree.
+
+        Pressing it again while pending does nothing, so two people working the same queue cannot
+        refund twice. Payment Service also treats the return id as its idempotency key, which is a
+        unique constraint there — a republished command refunds once.
+
+        A failure puts the return back to **RECEIVED** with the provider's reason on it, so it can
+        be retried once whatever went wrong is fixed.
+      parameters:
+        - { name: returnId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The refund has been asked for
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Return" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  # ------------------------------------------------------------------ reviews
+  /api/products/{productId}/reviews:
+    get:
+      tags: [Reviews]
+      summary: Published reviews of a product
+      description: |
+        Public, newest first. Pending and rejected reviews are visible only to their own author and
+        to administrators.
+      parameters:
+        - { name: productId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: page, in: query, schema: { type: integer, default: 0 } }
+        - { name: size, in: query, schema: { type: integer, default: 10, maximum: 50 } }
+      responses:
+        "200": { description: A page of reviews }
+    put:
+      tags: [Reviews]
+      summary: Write or replace my review
+      description: |
+        One review per customer per product, so submitting again edits the one already written
+        rather than adding a second — otherwise a product page is whoever is most persistent.
+
+        **An edit goes back into moderation.** Without that the queue is defeated by submitting
+        something bland, waiting for approval, and then editing it into whatever was actually
+        meant.
+
+        Leave `authorName` blank and only an initial is published. An email address is never
+        published: writing a review is not consent to that.
+      parameters:
+        - { name: productId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rating]
+              properties:
+                rating: { type: integer, minimum: 1, maximum: 5 }
+                title: { type: string, maxLength: 150 }
+                body: { type: string, maxLength: 4000 }
+                authorName: { type: string, maxLength: 100 }
+      responses:
+        "201": { description: The review, usually PENDING }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Conflict" }
+
+  # ------------------------------------------------------------------ catalogue sections
+  /api/categories:
+    get:
+      tags: [Categories]
+      summary: The catalogue menu
+      description: |
+        Public. Top-level sections with their subsections nested inside, in the order a shop chose
+        rather than alphabetically.
+
+        Filters and links use `slug`, never `name`. The name is a label a merchandiser can change;
+        the slug is what URLs, saved filters and — on the server — the tax rate card key on.
+      parameters:
+        - { name: includeInactive, in: query, schema: { type: boolean, default: false } }
+      responses:
+        "200": { description: The section tree }
+
+  # ------------------------------------------------------------------ guest checkout
+  /api/auth/guest:
+    post:
+      tags: [Authentication]
+      summary: Check out without an account
+      description: |
+        Creates an account with **no password** and returns an ordinary session for it. A guest is
+        a real customer as far as everything downstream is concerned — the basket, the order, the
+        payment and the saga are unchanged.
+
+        They cannot sign in until they set a password through the ordinary reset flow, at which
+        point their order history is already there.
+
+        **An address that already has an account is refused with `409`.** This endpoint hands out a
+        session in exchange for an email address and nothing else; returning one for an existing
+        account would let anybody type your address and be signed in as you.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+                fullName: { type: string, maxLength: 150 }
+      responses:
+        "201": { description: A session }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  # ------------------------------------------------------------------ payments
+  /api/payments/process:
+    post:
+      tags: [Payments]
+      summary: Charge an order manually
+      description: |
+        The normal flow charges automatically on `inventory.reserved`. This endpoint exists for
+        operator-driven retries and for clients paying outside that flow; it enforces the same
+        one-payment-per-order guarantee.
+
+        A decline returns `402` **with the payment as the body** — the payment was recorded and
+        the saga was told; the status code only reports that the order is not paid.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [orderId, amount]
+              properties:
+                orderId: { type: string, format: uuid }
+                orderNumber: { type: string, maxLength: 32 }
+                amount: { type: number, format: double, exclusiveMinimum: true, minimum: 0 }
+                currency: { type: string, pattern: "^[A-Z]{3}$", example: EUR }
+                method:
+                  type: string
+                  enum: [CARD, IDEAL, PAYPAL, BANK_TRANSFER]
+                  default: CARD
+      responses:
+        "200":
+          description: Payment approved
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Payment" }
+        "402":
+          description: Payment declined; the body carries the recorded payment
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Payment" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: The order has already been paid (`PAYMENT_ALREADY_PROCESSED`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /api/payments/{id}:
+    get:
+      tags: [Payments]
+      summary: Fetch one payment
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The payment
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Payment" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/payments/order/{orderId}:
+    get:
+      tags: [Payments]
+      summary: Fetch the payment for an order
+      parameters:
+        - { name: orderId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The payment
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Payment" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ------------------------------------------------------------------ notifications
+  /api/notifications:
+    get:
+      tags: [Notifications]
+      summary: List notifications
+      description: A customer sees their own; an `ADMIN` sees every notification.
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [PENDING, SENT, FAILED] } }
+        - { name: page, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+        - { name: size, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - name: sortBy
+          in: query
+          schema: { type: string, enum: [createdAt, sentAt, status], default: createdAt }
+        - { name: direction, in: query, schema: { type: string, enum: [asc, desc], default: desc } }
+      responses:
+        "200":
+          description: A page of notifications
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data:
+                        allOf:
+                          - $ref: "#/components/schemas/Page"
+                          - type: object
+                            properties:
+                              content:
+                                type: array
+                                items: { $ref: "#/components/schemas/Notification" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/notifications/{id}:
+    get:
+      tags: [Notifications]
+      summary: Fetch one notification
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The notification
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Notification" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access token returned by `POST /api/auth/login`
+
+  # This file is the hand-written contract for the paths that matter most. It is deliberately
+  # not exhaustive: each service serves its own generated definition at /v3/api-docs, aggregated
+  # behind the gateway at /swagger-ui.html, and that is authoritative for everything else --
+  # notably the back-office endpoints for warehouses, stock levels, product images and review
+  # moderation, which no external client calls.
+
+  responses:
+    Unauthorized:
+      description: No valid access token (`UNAUTHORIZED`, `TOKEN_EXPIRED`, `TOKEN_INVALID`)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+    Forbidden:
+      description: Authenticated, but not allowed (`FORBIDDEN`)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+    NotFound:
+      description: No such resource
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+    ValidationFailed:
+      description: Request validation failed; `fieldErrors` lists every violated constraint
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+    Conflict:
+      description: |
+        The request is well formed but the resource is not in a state that allows it
+        (`ORDER_NOT_MODIFIABLE`, `CONFLICT`). The message says what to do about it.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+    RateLimited:
+      description: Too many requests (`RATE_LIMITED`)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  schemas:
+    AuditEntry:
+      type: object
+      description: One thing an operator did. Append-only; the database refuses UPDATE outright.
+      properties:
+        id: { type: string, format: uuid }
+        service:
+          type: string
+          description: >-
+            Which service recorded it. Stamped by the back end because the log is per service and
+            a merged view has to say where each row came from.
+        actorId:
+          type: string
+          format: uuid
+          nullable: true
+          description: >-
+            Null for something the system did on its own — an event arrived, or a scheduled job
+            ran. Null is the answer to "who did this", not a missing value.
+        actorEmail:
+          type: string
+          nullable: true
+          description: Copied at the time, so it still reads after the account is renamed or erased.
+        action: { type: string, example: ROLES_CHANGED }
+        targetType: { type: string, example: USER }
+        targetId: { type: string, nullable: true }
+        summary:
+          type: string
+          nullable: true
+          description: >-
+            One sentence naming the change. Deliberately not a before/after diff: storing old and
+            new values would copy personal data into a table with a two-year retention.
+        sourceIp: { type: string, nullable: true }
+        correlationId: { type: string, nullable: true }
+        occurredAt: { type: string, format: date-time }
+
+    AuditSlice:
+      type: object
+      description: >-
+        A page of entries and the position to continue from. No total count, by design — see the
+        endpoint description.
+      properties:
+        entries:
+          type: array
+          items: { $ref: "#/components/schemas/AuditEntry" }
+        hasMore: { type: boolean }
+        nextBeforeAt: { type: string, format: date-time, nullable: true }
+        nextBeforeId: { type: string, format: uuid, nullable: true }
+
+    Return:
+      type: object
+      description: >-
+        A request to send goods back. Its lifecycle is separate from the order saga: the order
+        stays COMPLETED throughout.
+      properties:
+        id: { type: string, format: uuid }
+        orderId: { type: string, format: uuid }
+        orderNumber: { type: string }
+        status:
+          type: string
+          enum: [REQUESTED, APPROVED, REJECTED, RECEIVED, REFUND_PENDING, REFUNDED, CANCELLED]
+          description: >-
+            REQUESTED -> APPROVED -> RECEIVED -> REFUND_PENDING -> REFUNDED is the ordinary path.
+            REJECTED ends it after a decision, CANCELLED when the customer calls it off before
+            one. A failed refund returns it to RECEIVED with refundFailure set.
+        reason:
+          type: string
+          description: The customer's own words, kept verbatim.
+        refundAmount:
+          type: number
+          description: Frozen when the request is raised, from the prices actually charged.
+        currency: { type: string, example: EUR }
+        refundShipping:
+          type: boolean
+          description: True only when the whole order came back.
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/ReturnItem" }
+        requestedAt: { type: string, format: date-time }
+        decidedAt: { type: string, format: date-time, nullable: true }
+        decisionNote:
+          type: string
+          nullable: true
+          description: Shown to the customer. On a refusal it is the only explanation they get.
+        receivedAt: { type: string, format: date-time, nullable: true }
+        restocked:
+          type: boolean
+          nullable: true
+          description: >-
+            Whether the goods went back on sale. Null until they arrive — null and false are
+            different answers: "not opened yet" against "opened and written off".
+        refundedAt: { type: string, format: date-time, nullable: true }
+        refundReference:
+          type: string
+          nullable: true
+          description: The acquirer's reference, once there is one. What reconciliation matches on.
+        refundFailure:
+          type: string
+          nullable: true
+          description: Why the last refund attempt failed. The return can be retried.
+
+    ReturnItem:
+      type: object
+      properties:
+        orderItemId: { type: string, format: uuid }
+        productId: { type: string, format: uuid }
+        productName: { type: string }
+        sku: { type: string }
+        quantity: { type: integer }
+        refundAmount:
+          type: number
+          description: >-
+            Net at the price actually charged, plus tax at the rate frozen on the order. Computed
+            per line and rounded once, never apportioned out of an order total.
+
+    ReturnableLine:
+      type: object
+      properties:
+        orderItemId: { type: string, format: uuid }
+        productId: { type: string, format: uuid }
+        productName: { type: string }
+        sku: { type: string }
+        orderedQuantity: { type: integer }
+        alreadyReturned:
+          type: integer
+          description: >-
+            Claimed by an open or settled return. A rejected or cancelled one does not count,
+            because no goods moved.
+        returnableQuantity: { type: integer }
+        refundPerUnit: { type: number }
+        currency: { type: string }
+
+    CreateReturnRequest:
+      type: object
+      required: [items, reason]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [orderItemId, quantity]
+            properties:
+              orderItemId:
+                type: string
+                format: uuid
+                description: >-
+                  The order line, not the product: one order can carry the same product on two
+                  lines and they may be returned separately.
+              quantity: { type: integer, minimum: 1 }
+        reason:
+          type: string
+          maxLength: 500
+          description: >-
+            Why, in the customer's own words. A faulty item and a change of mind need different
+            handling, and a dropdown always lacks the case in front of you.
+
+    ReturnDecision:
+      type: object
+      properties:
+        note:
+          type: string
+          maxLength: 500
+          description: Shown to the customer.
+
+    Cart:
+      type: object
+      description: |
+        A basket, priced from the live catalogue. `total` covers only the lines that can actually
+        be bought — a total including something out of stock is a number the checkout will not
+        honour. `checkoutable` is the single answer to whether the button can be enabled.
+      properties:
+        id: { type: string, format: uuid }
+        totalQuantity: { type: integer }
+        total: { type: number }
+        currency: { type: string }
+        checkoutable: { type: boolean }
+        lines:
+          type: array
+          items:
+            type: object
+            properties:
+              productId: { type: string, format: uuid }
+              name: { type: string }
+              quantity: { type: integer }
+              unitPrice: { type: number, description: Today's price, read live }
+              lineTotal: { type: number }
+              availableQuantity: { type: integer }
+              available: { type: boolean }
+              issue:
+                type: string
+                nullable: true
+                description: >-
+                  "Out of stock", "Only 2 left", "No longer for sale". Null when the line is fine.
+                  The line is reported, never silently removed or reduced.
+
+    CouponRequest:
+      type: object
+      required: [code, type, value]
+      properties:
+        code:
+          type: string
+          maxLength: 40
+          description: Immutable once created. Stored and matched upper case.
+        description: { type: string, maxLength: 200 }
+        type: { type: string, enum: [PERCENTAGE, FIXED_AMOUNT, FREE_SHIPPING] }
+        value:
+          type: number
+          description: >-
+            A fraction for PERCENTAGE (0.1000 is 10%), an amount for FIXED_AMOUNT, ignored for
+            FREE_SHIPPING. A percentage of 1 or more is refused rather than interpreted.
+        currency:
+          type: string
+          description: >-
+            Required for FIXED_AMOUNT. Such a code is refused on an order in another currency
+            rather than converted — inventing an exchange rate at checkout is worse than refusing
+            the code.
+        minimumBasket: { type: number }
+        maxRedemptions:
+          type: integer
+          nullable: true
+          description: Null for unlimited. Cannot be lowered below what has already been redeemed.
+        perCustomerLimit: { type: integer, nullable: true }
+        validFrom: { type: string, format: date-time }
+        validUntil: { type: string, format: date-time }
+        active: { type: boolean }
+
+    CouponPreview:
+      type: object
+      description: >-
+        Two figures, not one: a reduction on the goods lowers the tax with it, and free delivery
+        does not touch the tax at all.
+      properties:
+        code: { type: string }
+        type: { type: string, enum: [PERCENTAGE, FIXED_AMOUNT, FREE_SHIPPING] }
+        description: { type: string, nullable: true }
+        goodsDiscount: { type: number }
+        shippingDiscount: { type: number }
+        currency: { type: string }
+
+    ShippingQuote:
+      type: object
+      properties:
+        method: { type: string, enum: [STANDARD, EXPRESS, PICKUP] }
+        amount: { type: number }
+        currency: { type: string }
+        minDays: { type: integer }
+        maxDays: { type: integer }
+        free: { type: boolean }
+        description: { type: string, example: "2-4 working days" }
+
+
+    ApiResponse:
+      type: object
+      description: Uniform success envelope.
+      properties:
+        success: { type: boolean, example: true }
+        data: { description: The payload }
+        message: { type: string, nullable: true }
+        timestamp: { type: string, format: date-time }
+        correlationId:
+          type: string
+          nullable: true
+          description: Quote this in a support request; it stitches the saga together in the logs.
+
+    ErrorResponse:
+      type: object
+      description: Uniform error envelope.
+      properties:
+        success: { type: boolean, example: false }
+        timestamp: { type: string, format: date-time }
+        status: { type: integer, example: 409 }
+        error: { type: string, example: Conflict }
+        code:
+          type: string
+          example: INSUFFICIENT_STOCK
+          description: Machine readable error code; stable across releases.
+        message: { type: string }
+        path: { type: string, example: /api/orders }
+        correlationId: { type: string, nullable: true }
+        fieldErrors:
+          type: array
+          nullable: true
+          items:
+            type: object
+            properties:
+              field: { type: string, example: email }
+              rejectedValue: {}
+              message: { type: string, example: must be a valid address }
+
+    Page:
+      type: object
+      properties:
+        content: { type: array, items: {} }
+        page: { type: integer, example: 0 }
+        size: { type: integer, example: 20 }
+        totalElements: { type: integer, format: int64, example: 137 }
+        totalPages: { type: integer, example: 7 }
+        first: { type: boolean }
+        last: { type: boolean }
+
+    RegisterRequest:
+      type: object
+      required: [email, password, fullName]
+      properties:
+        email: { type: string, format: email, maxLength: 255, example: ada@commerceflow.io }
+        password:
+          type: string
+          format: password
+          minLength: 8
+          maxLength: 72
+          description: At least one letter and one digit.
+          example: S3cret-pass
+        fullName: { type: string, maxLength: 150, example: Ada Lovelace }
+        phone: { type: string, maxLength: 32, nullable: true, example: "+31612345678" }
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, example: ada@commerceflow.io }
+        password: { type: string, format: password, example: S3cret-pass }
+
+    AuthTokens:
+      type: object
+      properties:
+        accessToken:
+          type: string
+          description: "Short lived JWT; send as the `Authorization: Bearer <token>` header."
+        refreshToken:
+          type: string
+          description: Long lived and single use — presenting it rotates the pair.
+        tokenType: { type: string, example: Bearer }
+        expiresIn: { type: integer, format: int64, example: 900, description: Seconds }
+        user: { $ref: "#/components/schemas/User" }
+
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        fullName: { type: string }
+        phone: { type: string, nullable: true }
+        roles:
+          type: array
+          items: { type: string, enum: [CUSTOMER, ADMIN] }
+        enabled: { type: boolean }
+        createdAt: { type: string, format: date-time }
+
+    Product:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        sku: { type: string, example: CF-LAPTOP-001 }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        category: { type: string, nullable: true, example: COMPUTERS }
+        price: { type: number, format: double, example: 1899.00 }
+        currency: { type: string, example: EUR }
+        imageUrl: { type: string, nullable: true }
+        active: { type: boolean }
+        availableQuantity:
+          type: integer
+          description: Units a new order may consume.
+        reservedQuantity:
+          type: integer
+          description: Units held by orders whose saga is still running.
+        inStock: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    CreateProductRequest:
+      type: object
+      required: [sku, name, price, initialQuantity]
+      properties:
+        sku: { type: string, maxLength: 64, pattern: "^[A-Za-z0-9._-]+$", example: CF-LAPTOP-001 }
+        name: { type: string, maxLength: 200 }
+        description: { type: string, maxLength: 2000 }
+        category: { type: string, maxLength: 100 }
+        price: { type: number, format: double, example: 1899.00 }
+        currency: { type: string, pattern: "^[A-Z]{3}$", default: EUR }
+        imageUrl: { type: string, maxLength: 500 }
+        initialQuantity: { type: integer, minimum: 0, example: 100 }
+        reorderLevel: { type: integer, minimum: 0, example: 10 }
+
+    CreateOrderRequest:
+      type: object
+      required: [items, shippingAddress]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            type: object
+            required: [productId, quantity]
+            properties:
+              productId: { type: string, format: uuid }
+              quantity: { type: integer, minimum: 1, maximum: 999 }
+        shippingAddress:
+          type: string
+          maxLength: 500
+          example: Keizersgracht 1, 1015 CJ Amsterdam, NL
+        idempotencyKey:
+          type: string
+          maxLength: 64
+          nullable: true
+          description: Replaying this key returns the original order instead of creating a second one.
+
+    Order:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        orderNumber: { type: string, example: CF-20260826-000123 }
+        userId: { type: string, format: uuid }
+        userEmail: { type: string, format: email }
+        status:
+          type: string
+          enum: [CREATED, INVENTORY_RESERVED, PAID, COMPLETED, CANCELLED]
+        totalAmount: { type: number, format: double, example: 3798.00 }
+        currency: { type: string, example: EUR }
+        shippingAddress: { type: string }
+        itemCount: { type: integer, example: 3 }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              productId: { type: string, format: uuid }
+              sku: { type: string }
+              productName:
+                type: string
+                description: Snapshotted at order time; a later catalogue change never rewrites it.
+              quantity: { type: integer }
+              unitPrice: { type: number, format: double }
+              subtotal: { type: number, format: double }
+        paymentId: { type: string, format: uuid, nullable: true }
+        failedStep:
+          type: string
+          nullable: true
+          enum: [INVENTORY, PAYMENT]
+          description: Present when the order was cancelled.
+        failureReason: { type: string, nullable: true, example: OUT_OF_STOCK }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        completedAt: { type: string, format: date-time, nullable: true }
+
+    Payment:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        orderId: { type: string, format: uuid }
+        orderNumber: { type: string, nullable: true }
+        userId: { type: string, format: uuid, nullable: true }
+        amount: { type: number, format: double }
+        currency: { type: string, example: EUR }
+        status: { type: string, enum: [PENDING, COMPLETED, FAILED, REFUNDED] }
+        method: { type: string, enum: [CARD, IDEAL, PAYPAL, BANK_TRANSFER] }
+        transactionId:
+          type: string
+          nullable: true
+          description: Acquirer reference; present once the charge is approved.
+        failureReason: { type: string, nullable: true, example: INSUFFICIENT_FUNDS }
+        createdAt: { type: string, format: date-time }
+        processedAt: { type: string, format: date-time, nullable: true }
+
+    Notification:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        userId: { type: string, format: uuid, nullable: true }
+        referenceId:
+          type: string
+          format: uuid
+          nullable: true
+          description: The entity this notification is about, typically an order id.
+        type: { type: string, enum: [USER_WELCOME, ORDER_CONFIRMED, ORDER_CANCELLED, GENERIC] }
+        channel: { type: string, enum: [EMAIL, SMS, PUSH] }
+        recipient: { type: string }
+        subject: { type: string }
+        content: { type: string }
+        status: { type: string, enum: [PENDING, SENT, FAILED] }
+        failureReason: { type: string, nullable: true }
+        retryCount: { type: integer }
+        createdAt: { type: string, format: date-time }
+        sentAt: { type: string, format: date-time, nullable: true }

@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Shared logging configuration (ADR-009: structured JSON logs).
+
+  Every service ships a two-line logback-spring.xml that only includes this file, so the log
+  schema is identical across the platform and a single Loki/ELK pipeline can parse all of it.
+
+  JSON is the default. Activate the `local` profile for human readable console output.
+-->
+<included>
+
+    <springProperty scope="context" name="applicationName" source="spring.application.name"
+                    defaultValue="commerceflow"/>
+    <springProperty scope="context" name="applicationVersion" source="commerceflow.build.version"
+                    defaultValue="unknown"/>
+
+    <property name="PLAIN_PATTERN"
+              value="%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [${applicationName},%X{traceId:-},%X{spanId:-},%X{correlationId:-}] %logger{40} - %msg%n"/>
+
+    <appender name="CONSOLE_PLAIN" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>${PLAIN_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <appender name="CONSOLE_JSON" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <timeZone>UTC</timeZone>
+            <includeContext>false</includeContext>
+            <includeMdc>true</includeMdc>
+            <fieldNames>
+                <timestamp>timestamp</timestamp>
+                <version>[ignore]</version>
+                <levelValue>[ignore]</levelValue>
+                <thread>thread</thread>
+                <logger>logger</logger>
+                <message>message</message>
+                <stackTrace>stackTrace</stackTrace>
+            </fieldNames>
+            <customFields>{"service":"${applicationName}","version":"${applicationVersion}"}</customFields>
+            <throwableConverter class="net.logstash.logback.stacktrace.ShortenedThrowableConverter">
+                <maxDepthPerThrowable>40</maxDepthPerThrowable>
+                <maxLength>8192</maxLength>
+                <shortenedClassNameLength>40</shortenedClassNameLength>
+                <rootCauseFirst>true</rootCauseFirst>
+            </throwableConverter>
+        </encoder>
+    </appender>
+
+    <appender name="ASYNC_JSON" class="ch.qos.logback.classic.AsyncAppender">
+        <appender-ref ref="CONSOLE_JSON"/>
+        <queueSize>2048</queueSize>
+        <discardingThreshold>0</discardingThreshold>
+        <neverBlock>true</neverBlock>
+        <includeCallerData>false</includeCallerData>
+    </appender>
+
+    <!-- Noise control: identical in every service. -->
+    <logger name="org.apache.kafka" level="WARN"/>
+    <logger name="org.apache.kafka.clients.NetworkClient" level="ERROR"/>
+    <logger name="org.springframework.kafka" level="INFO"/>
+    <logger name="org.hibernate.orm.deprecation" level="ERROR"/>
+    <logger name="com.zaxxer.hikari" level="INFO"/>
+    <logger name="org.testcontainers" level="INFO"/>
+
+    <springProfile name="local | test">
+        <logger name="com.commerceflow" level="DEBUG"/>
+        <root level="${LOG_LEVEL:-INFO}">
+            <appender-ref ref="CONSOLE_PLAIN"/>
+        </root>
+    </springProfile>
+
+    <springProfile name="!local &amp; !test">
+        <logger name="com.commerceflow" level="${APP_LOG_LEVEL:-INFO}"/>
+        <root level="${LOG_LEVEL:-INFO}">
+            <appender-ref ref="ASYNC_JSON"/>
+        </root>
+    </springProfile>
+
+</included>

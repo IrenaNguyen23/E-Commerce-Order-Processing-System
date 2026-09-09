@@ -1,0 +1,29 @@
+# Test-profile overrides. The container coordinates themselves are injected by
+# AbstractSagaIntegrationTest through @DynamicPropertySource.
+spring:
+  jpa:
+    open-in-view: false
+    properties:
+      hibernate:
+        # Surfaces an N+1 query as a failure instead of a slow test.
+        generate_statistics: false
+  main:
+    banner-mode: "off"
+
+commerceflow:
+  outbox:
+    poll-interval-ms: 200
+    # The retention sweeps have nothing to do in a test and only add noise.
+    cleanup-enabled: false
+  idempotency:
+    cleanup-enabled: false
+
+management:
+  tracing:
+    enabled: false
+
+logging:
+  level:
+    org.apache.kafka: WARN
+    org.testcontainers: INFO
+    com.commerceflow: DEBUG

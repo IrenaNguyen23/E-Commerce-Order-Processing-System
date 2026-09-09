@@ -1,0 +1,60 @@
+# =====================================================================================
+# Shared Kafka client configuration.
+#
+# Imported by every service with:
+#
+#   spring:
+#     config:
+#       import: classpath:commerceflow-kafka.yml
+#
+# Imported documents have lower precedence than the importing one, so a service can still
+# override any value locally. Only `spring.kafka.consumer.group-id` is left unset — each
+# service must declare its own group.
+#
+# The `spring.json.type.mapping` alias table is contributed programmatically by
+# CommonKafkaAutoConfiguration so it can never drift from KafkaTypeMappings.
+# =====================================================================================
+spring:
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    client-id: ${spring.application.name:commerceflow}
+
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      # Durability: never acknowledge before every in-sync replica has the record.
+      acks: all
+      retries: 10
+      compression-type: gzip
+      properties:
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 5
+        delivery.timeout.ms: 120000
+        request.timeout.ms: 30000
+        linger.ms: 10
+
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # Wrapping the JSON deserializer means a poison payload surfaces as a handled
+      # DeserializationException that goes straight to the DLT instead of killing the container.
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      max-poll-records: 50
+      properties:
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JsonDeserializer
+        spring.json.trusted.packages: com.commerceflow.common.event
+        isolation.level: read_committed
+        max.poll.interval.ms: 300000
+
+    listener:
+      ack-mode: record
+      concurrency: 3
+      missing-topics-fatal: false
+      observation-enabled: true
+
+    template:
+      observation-enabled: true
+
+    admin:
+      fail-fast: false

@@ -1,0 +1,384 @@
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+  netty:
+    connection-timeout: 5s
+    idle-timeout: 60s
+  forward-headers-strategy: framework
+
+spring:
+  application:
+    name: api-gateway
+
+  main:
+    banner-mode: "off"
+    web-application-type: reactive
+
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 2s
+
+  cloud:
+    gateway:
+      # No service registry (ADR-003): routes point at static DNS names that Docker Compose and
+      # Kubernetes both resolve.
+      discovery:
+        locator:
+          enabled: false
+
+      httpclient:
+        connect-timeout: 3000
+        response-timeout: 20s
+        pool:
+          max-connections: 200
+          acquire-timeout: 10000
+
+      default-filters:
+        - DedupeResponseHeader=Access-Control-Allow-Origin Access-Control-Allow-Credentials, RETAIN_FIRST
+
+      routes:
+        # ---------------------------------------------------------------- auth
+        - id: auth-service
+          uri: ${AUTH_SERVICE_URL:http://localhost:8081}
+          predicates:
+            - Path=/api/auth/**
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: authCircuitBreaker
+                fallbackUri: forward:/fallback/auth
+            - name: RequestRateLimiter
+              args:
+                # Pre-login by definition, so the bucket is per IP: these are the endpoints
+                # actually worth brute forcing.
+                key-resolver: "#{@ipKeyResolver}"
+                redis-rate-limiter.replenishRate: 10
+                redis-rate-limiter.burstCapacity: 20
+                redis-rate-limiter.requestedTokens: 1
+
+        # ---------------------------------------------------------------- accounts
+        #
+        # Also Auth Service, but a separate route on purpose. /api/auth/** is pre-login and
+        # rate limited per IP, because those are the endpoints worth brute forcing. Everything
+        # under /api/users/** requires a token already, so the bucket is per client — sharing
+        # the login route's per-IP bucket would let one office share one allowance.
+        - id: account-service
+          uri: ${AUTH_SERVICE_URL:http://localhost:8081}
+          predicates:
+            - Path=/api/users/**
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: authCircuitBreaker
+                fallbackUri: forward:/fallback/auth
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@clientKeyResolver}"
+                redis-rate-limiter.replenishRate: 30
+                redis-rate-limiter.burstCapacity: 60
+
+        # ---------------------------------------------------------------- orders
+        - id: order-service
+          uri: ${ORDER_SERVICE_URL:http://localhost:8082}
+          predicates:
+            # Everything Order Service owns. Basket, wishlist, coupons, delivery quotes and
+            # shipments all live there because each is meaningless without an order, and a
+            # route per path would be five more places to forget when one moves.
+            - Path=/api/orders/**,/api/cart/**,/api/wishlist/**,/api/coupons/**,/api/shipping/**,/api/shipments/**,/api/returns/**
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: orderCircuitBreaker
+                fallbackUri: forward:/fallback/order
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@clientKeyResolver}"
+                redis-rate-limiter.replenishRate: 30
+                redis-rate-limiter.burstCapacity: 60
+
+        # ---------------------------------------------------------------- catalogue
+        - id: inventory-service
+          uri: ${INVENTORY_SERVICE_URL:http://localhost:8083}
+          predicates:
+            - Path=/api/products/**,/api/categories/**,/api/reviews/**,/api/warehouses/**
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: inventoryCircuitBreaker
+                fallbackUri: forward:/fallback/inventory
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@clientKeyResolver}"
+                redis-rate-limiter.replenishRate: 100
+                redis-rate-limiter.burstCapacity: 200
+
+        # ---------------------------------------------------------------- payments
+        - id: payment-service
+          uri: ${PAYMENT_SERVICE_URL:http://localhost:8084}
+          predicates:
+            - Path=/api/payments/**
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: paymentCircuitBreaker
+                fallbackUri: forward:/fallback/payment
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@clientKeyResolver}"
+                redis-rate-limiter.replenishRate: 20
+                redis-rate-limiter.burstCapacity: 40
+
+        # ---------------------------------------------------------------- notifications
+        - id: notification-service
+          uri: ${NOTIFICATION_SERVICE_URL:http://localhost:8085}
+          predicates:
+            - Path=/api/notifications/**
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: notificationCircuitBreaker
+                fallbackUri: forward:/fallback/notification
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@clientKeyResolver}"
+                redis-rate-limiter.replenishRate: 30
+                redis-rate-limiter.burstCapacity: 60
+
+        # ---------------------------------------------------------------- audit trail
+        #
+        # Five routes for one endpoint, because the audit log is deliberately not centralised:
+        # each service writes its own rows into its own database, in the same transaction as the
+        # change they describe. A shared audit table would be a synchronous dependency on the
+        # write path of every service — audit database down, shop stops accepting changes.
+        #
+        # So the service is chosen by the path, and the back office asks all five and merges the
+        # answers. `/api/audit/orders/...` reaches Order Service as `/api/audit/...`.
+        #
+        # Administrator only, enforced by @PreAuthorize in each service rather than here: a
+        # request that reaches a pod directly, bypassing this gateway, must not be trusted.
+        - id: audit-auth
+          uri: ${AUTH_SERVICE_URL:http://localhost:8081}
+          predicates:
+            - Path=/api/audit/auth/**
+          filters:
+            - RewritePath=/api/audit/auth(?<remaining>/?.*), /api/audit$\{remaining}
+            - name: CircuitBreaker
+              args:
+                name: authCircuitBreaker
+                fallbackUri: forward:/fallback/auth
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@clientKeyResolver}"
+                redis-rate-limiter.replenishRate: 30
+                redis-rate-limiter.burstCapacity: 60
+
+        - id: audit-order
+          uri: ${ORDER_SERVICE_URL:http://localhost:8082}
+          predicates:
+            - Path=/api/audit/orders/**
+          filters:
+            - RewritePath=/api/audit/orders(?<remaining>/?.*), /api/audit$\{remaining}
+            - name: CircuitBreaker
+              args:
+                name: orderCircuitBreaker
+                fallbackUri: forward:/fallback/order
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@clientKeyResolver}"
+                redis-rate-limiter.replenishRate: 30
+                redis-rate-limiter.burstCapacity: 60
+
+        - id: audit-inventory
+          uri: ${INVENTORY_SERVICE_URL:http://localhost:8083}
+          predicates:
+            - Path=/api/audit/inventory/**
+          filters:
+            - RewritePath=/api/audit/inventory(?<remaining>/?.*), /api/audit$\{remaining}
+            - name: CircuitBreaker
+              args:
+                name: inventoryCircuitBreaker
+                fallbackUri: forward:/fallback/inventory
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@clientKeyResolver}"
+                redis-rate-limiter.replenishRate: 30
+                redis-rate-limiter.burstCapacity: 60
+
+        - id: audit-payment
+          uri: ${PAYMENT_SERVICE_URL:http://localhost:8084}
+          predicates:
+            - Path=/api/audit/payments/**
+          filters:
+            - RewritePath=/api/audit/payments(?<remaining>/?.*), /api/audit$\{remaining}
+            - name: CircuitBreaker
+              args:
+                name: paymentCircuitBreaker
+                fallbackUri: forward:/fallback/payment
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@clientKeyResolver}"
+                redis-rate-limiter.replenishRate: 30
+                redis-rate-limiter.burstCapacity: 60
+
+        - id: audit-notification
+          uri: ${NOTIFICATION_SERVICE_URL:http://localhost:8085}
+          predicates:
+            - Path=/api/audit/notifications/**
+          filters:
+            - RewritePath=/api/audit/notifications(?<remaining>/?.*), /api/audit$\{remaining}
+            - name: CircuitBreaker
+              args:
+                name: notificationCircuitBreaker
+                fallbackUri: forward:/fallback/notification
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@clientKeyResolver}"
+                redis-rate-limiter.replenishRate: 30
+                redis-rate-limiter.burstCapacity: 60
+
+        # ------------------------------------------------- aggregated API documentation
+        - id: auth-service-docs
+          uri: ${AUTH_SERVICE_URL:http://localhost:8081}
+          predicates:
+            - Path=/v3/api-docs/auth-service
+          filters:
+            - SetPath=/v3/api-docs
+        - id: order-service-docs
+          uri: ${ORDER_SERVICE_URL:http://localhost:8082}
+          predicates:
+            - Path=/v3/api-docs/order-service
+          filters:
+            - SetPath=/v3/api-docs
+        - id: inventory-service-docs
+          uri: ${INVENTORY_SERVICE_URL:http://localhost:8083}
+          predicates:
+            - Path=/v3/api-docs/inventory-service
+          filters:
+            - SetPath=/v3/api-docs
+        - id: payment-service-docs
+          uri: ${PAYMENT_SERVICE_URL:http://localhost:8084}
+          predicates:
+            - Path=/v3/api-docs/payment-service
+          filters:
+            - SetPath=/v3/api-docs
+        - id: notification-service-docs
+          uri: ${NOTIFICATION_SERVICE_URL:http://localhost:8085}
+          predicates:
+            - Path=/v3/api-docs/notification-service
+          filters:
+            - SetPath=/v3/api-docs
+
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        slidingWindowType: COUNT_BASED
+        slidingWindowSize: 20
+        minimumNumberOfCalls: 10
+        failureRateThreshold: 50
+        slowCallRateThreshold: 80
+        slowCallDurationThreshold: 5s
+        waitDurationInOpenState: 15s
+        permittedNumberOfCallsInHalfOpenState: 5
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+        registerHealthIndicator: true
+    instances:
+      authCircuitBreaker:
+        baseConfig: default
+      orderCircuitBreaker:
+        baseConfig: default
+      inventoryCircuitBreaker:
+        baseConfig: default
+      paymentCircuitBreaker:
+        baseConfig: default
+        # Money moves here: give the acquirer more room before tripping.
+        slowCallDurationThreshold: 10s
+      notificationCircuitBreaker:
+        baseConfig: default
+  timelimiter:
+    configs:
+      default:
+        timeoutDuration: 20s
+        cancelRunningFuture: true
+    instances:
+      authCircuitBreaker:
+        baseConfig: default
+      orderCircuitBreaker:
+        baseConfig: default
+      inventoryCircuitBreaker:
+        baseConfig: default
+      paymentCircuitBreaker:
+        timeoutDuration: 30s
+      notificationCircuitBreaker:
+        baseConfig: default
+
+commerceflow:
+  security:
+    jwt:
+      # The gateway verifies tokens with the same key Auth Service signs them with.
+      secret: ${JWT_SECRET:commerceflow-local-development-secret-change-me-before-production}
+      issuer: ${JWT_ISSUER:commerceflow}
+      access-token-ttl: ${JWT_ACCESS_TTL:15m}
+      refresh-token-ttl: ${JWT_REFRESH_TTL:7d}
+      clock-skew: 30s
+  gateway:
+    allowed-origins: ${CORS_ALLOWED_ORIGINS:*}
+
+springdoc:
+  api-docs:
+    enabled: true
+  swagger-ui:
+    path: /swagger-ui.html
+    config-url: /v3/api-docs/swagger-config
+    disable-swagger-default-url: true
+    urls:
+      - name: auth-service
+        url: /v3/api-docs/auth-service
+      - name: order-service
+        url: /v3/api-docs/order-service
+      - name: inventory-service
+        url: /v3/api-docs/inventory-service
+      - name: payment-service
+        url: /v3/api-docs/payment-service
+      - name: notification-service
+        url: /v3/api-docs/notification-service
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,gateway
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: when_authorized
+      group:
+        readiness:
+          include: readinessState,redis
+    gateway:
+      access: read-only
+  metrics:
+    tags:
+      application: ${spring.application.name}
+  observations:
+    key-values:
+      application: ${spring.application.name}
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLE_RATE:0.1}
+  otlp:
+    tracing:
+      endpoint: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:http://localhost:4318/v1/traces}
+
+info:
+  app:
+    name: ${spring.application.name}
+    description: CommerceFlow API Gateway
+    version: 1.0.0

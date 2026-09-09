@@ -1,0 +1,189 @@
+# =====================================================================================
+# Continuous deployment to Kubernetes (ci-cd.md).
+#
+# Deploys the image tag that CI already built and pushed — this workflow never builds, so what
+# reaches production is byte-for-byte what was tested.
+#
+# Staging deploys automatically from `main`; production needs a tag and a GitHub Environment
+# approval, which is where the human gate lives.
+# =====================================================================================
+name: CD
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options: [staging, production]
+        default: staging
+      image_tag:
+        description: Image tag to deploy (defaults to the commit SHA)
+        required: false
+        type: string
+
+concurrency:
+  # Never let two deploys race for the same cluster.
+  group: cd-${{ github.event.inputs.environment || (startsWith(github.ref, 'refs/tags/') && 'production' || 'staging') }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || 'commerceflow' }}
+  SERVICES: "auth-service inventory-service order-service payment-service notification-service api-gateway"
+
+jobs:
+  deploy:
+    name: Deploy to ${{ github.event.inputs.environment || (startsWith(github.ref, 'refs/tags/') && 'production' || 'staging') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Only deploy when CI actually passed.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    environment:
+      name: ${{ github.event.inputs.environment || (startsWith(github.ref, 'refs/tags/') && 'production' || 'staging') }}
+      url: ${{ vars.PUBLIC_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the image tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.image_tag }}" ]; then
+            TAG="${{ github.event.inputs.image_tag }}"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF#refs/tags/v}"
+          else
+            TAG="${{ github.event.workflow_run.head_sha || github.sha }}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Deploying tag ${TAG}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.31.0
+
+      - name: Set up kustomize
+        uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: "5.4.3"
+
+      - name: Configure cluster access
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          if [ -z "$KUBE_CONFIG" ]; then
+            echo "::error::KUBE_CONFIG is not configured for this environment."
+            exit 1
+          fi
+          mkdir -p "$HOME/.kube"
+          echo "$KUBE_CONFIG" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          kubectl version --client
+          kubectl cluster-info
+
+      - name: Ensure the namespace and secrets exist
+        env:
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+        run: |
+          kubectl create namespace commerceflow --dry-run=client -o yaml | kubectl apply -f -
+
+          if [ -z "$JWT_SECRET" ]; then
+            echo "::error::JWT_SECRET is not configured for this environment."
+            exit 1
+          fi
+
+          # Applied separately from the manifests so the committed placeholder Secret can never
+          # overwrite the real one.
+          kubectl -n commerceflow create secret generic commerceflow-secrets \
+            --from-literal=JWT_SECRET="$JWT_SECRET" \
+            --from-literal=POSTGRES_USER="${POSTGRES_USER:-commerceflow}" \
+            --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+            --from-literal=REDIS_PASSWORD="${REDIS_PASSWORD:-}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Pin the image tags
+        working-directory: k8s
+        run: |
+          for service in $SERVICES; do
+            kustomize edit set image \
+              "${REGISTRY}/${IMAGE_NAMESPACE}/${service}=${REGISTRY}/${IMAGE_NAMESPACE}/${service}:${{ steps.tag.outputs.tag }}"
+          done
+          kustomize build . > /tmp/manifests.yaml
+          echo "Rendered $(grep -c '^kind:' /tmp/manifests.yaml) objects." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply
+        run: |
+          # The committed Secret template is excluded: the real secret was applied above.
+          kubectl apply -f /tmp/manifests.yaml --prune=false
+
+      - name: Wait for the rollout
+        run: |
+          FAILED=0
+          for service in $SERVICES; do
+            echo "::group::rollout ${service}"
+            if ! kubectl -n commerceflow rollout status "deployment/${service}" --timeout=5m; then
+              echo "::error::${service} failed to roll out"
+              FAILED=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $FAILED
+
+      - name: Roll back on failure
+        if: failure()
+        run: |
+          echo "::warning::Rolling back to the previous revision."
+          for service in $SERVICES; do
+            kubectl -n commerceflow rollout undo "deployment/${service}" || true
+          done
+          for service in $SERVICES; do
+            kubectl -n commerceflow rollout status "deployment/${service}" --timeout=5m || true
+          done
+
+      - name: Smoke test
+        run: |
+          # Port-forward rather than depend on external DNS being ready: this checks that the
+          # gateway is actually serving, not that the ingress happens to be warm.
+          kubectl -n commerceflow port-forward service/api-gateway 18080:8080 &
+          PF_PID=$!
+          trap 'kill $PF_PID 2>/dev/null || true' EXIT
+          sleep 8
+
+          for attempt in 1 2 3 4 5; do
+            if curl -fsS http://localhost:18080/actuator/health | tee /tmp/health.json | grep -q '"status":"UP"'; then
+              echo "Gateway is healthy." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "Attempt ${attempt} failed, retrying..."
+            sleep 5
+          done
+
+          echo "::error::Gateway did not report healthy after the deploy."
+          cat /tmp/health.json || true
+          exit 1
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          {
+            echo "### Deployment"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Environment | ${{ github.event.inputs.environment || (startsWith(github.ref, 'refs/tags/') && 'production' || 'staging') }} |"
+            echo "| Image tag | ${{ steps.tag.outputs.tag }} |"
+            echo "| Commit | ${{ github.sha }} |"
+            echo "| Result | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          kubectl -n commerceflow get pods -o wide || true
