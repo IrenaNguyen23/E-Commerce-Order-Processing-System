@@ -54,7 +54,7 @@ services:
       # Speeds up first start; the data volume is disposable in local development.
       POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
     ports:
-      - "5432:5432"
+      - "5433:5432"   # đổi từ "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./infrastructure/postgres/init:/docker-entrypoint-initdb.d:ro
@@ -149,6 +149,24 @@ services:
       KAFKA_CLUSTERS_0_NAME: commerceflow
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
       DYNAMIC_CONFIG_ENABLED: "true"
+
+  pgadmin:
+    image: dpage/pgadmin4:8.12
+    container_name: commerceflow-pgadmin
+    restart: unless-stopped
+    networks: [commerceflow]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "5050:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@commerceflow.io
+      PGADMIN_DEFAULT_PASSWORD: commerceflow
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+      - ./infrastructure/pgadmin/servers.json:/pgadmin4/servers.json:ro
 
   # ------------------------------------------------------------------ application services
 
@@ -437,3 +455,4 @@ volumes:
   kafka-data:
   prometheus-data:
   grafana-data:
+  pgadmin-data:

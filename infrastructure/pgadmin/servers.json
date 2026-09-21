@@ -1,0 +1,13 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "CommerceFlow",
+      "Group": "Servers",
+      "Host": "postgres",
+      "Port": 5433,
+      "MaintenanceDB": "commerceflow",
+      "Username": "commerceflow",
+      "SSLMode": "prefer"
+    }
+  }
+}

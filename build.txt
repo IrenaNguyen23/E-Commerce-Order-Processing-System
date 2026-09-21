@@ -1,0 +1,5 @@
+docker compose stop auth-service inventory-service order-service payment-service notification-service api-gateway web
+docker compose ps
+
+docker compose down -v
+docker compose up -d postgres redis kafka kafka-init kafka-ui pgadmin
