@@ -89,28 +89,27 @@ jobs:
           kubectl version --client
           kubectl cluster-info
 
-      - name: Ensure the namespace and secrets exist
+      - name: Generate runtime configuration
         env:
+          RUNTIME_ENV: ${{ secrets.RUNTIME_ENV }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
           POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+          STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
         run: |
-          kubectl create namespace commerceflow --dry-run=client -o yaml | kubectl apply -f -
-
-          if [ -z "$JWT_SECRET" ]; then
-            echo "::error::JWT_SECRET is not configured for this environment."
-            exit 1
+          umask 077
+          if [ -n "$RUNTIME_ENV" ]; then
+            printf '%s\n' "$RUNTIME_ENV" > .env
+            # The full environment secret is authoritative when provided.
+            unset JWT_SECRET POSTGRES_USER POSTGRES_PASSWORD REDIS_PASSWORD
+            unset STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET SMTP_PASSWORD
+          else
+            cp .env.example .env
           fi
-
-          # Applied separately from the manifests so the committed placeholder Secret can never
-          # overwrite the real one.
-          kubectl -n commerceflow create secret generic commerceflow-secrets \
-            --from-literal=JWT_SECRET="$JWT_SECRET" \
-            --from-literal=POSTGRES_USER="${POSTGRES_USER:-commerceflow}" \
-            --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
-            --from-literal=REDIS_PASSWORD="${REDIS_PASSWORD:-}" \
-            --dry-run=client -o yaml | kubectl apply -f -
+          python scripts/render-k8s-env.py
 
       - name: Pin the image tags
         working-directory: k8s
@@ -124,7 +123,7 @@ jobs:
 
       - name: Apply
         run: |
-          # The committed Secret template is excluded: the real secret was applied above.
+          # ConfigMap and Secret come from the generated, ignored .env inputs.
           kubectl apply -f /tmp/manifests.yaml --prune=false
 
       - name: Wait for the rollout

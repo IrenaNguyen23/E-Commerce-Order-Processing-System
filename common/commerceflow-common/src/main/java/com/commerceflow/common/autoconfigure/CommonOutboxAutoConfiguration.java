@@ -61,7 +61,10 @@ public class CommonOutboxAutoConfiguration {
     static class OutboxSchedulingConfiguration {
 
         @Bean
-        @ConditionalOnBean(OutboxRelay.class)
+        // Nested configurations are evaluated before the enclosing configuration's @Bean
+        // methods. Check the repository, which is already registered, rather than the relay
+        // that the enclosing configuration has not registered yet.
+        @ConditionalOnBean(OutboxRepository.class)
         @ConditionalOnMissingBean
         OutboxScheduler outboxScheduler(OutboxRelay relay, OutboxProperties properties) {
             return new OutboxScheduler(relay, properties);

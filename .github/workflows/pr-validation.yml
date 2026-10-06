@@ -46,7 +46,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Validate docker-compose.yml
-        run: docker compose -f docker-compose.yml config --quiet
+        run: |
+          python scripts/env.py init
+          docker compose -f docker-compose.yml config --quiet
+          python scripts/test_env.py
 
       - name: Set up kustomize
         uses: imranismail/setup-kustomize@v2
@@ -55,6 +58,7 @@ jobs:
 
       - name: Render the Kubernetes manifests
         run: |
+          python scripts/render-k8s-env.py
           kustomize build k8s/ > /tmp/rendered.yaml
           echo "Rendered $(grep -c '^kind:' /tmp/rendered.yaml) objects."
 
@@ -64,14 +68,13 @@ jobs:
         with:
           files: /tmp/rendered.yaml
 
-      - name: Check the placeholder secret was not filled in
+      - name: Ensure local environment files are not tracked
         run: |
-          # A real credential must never reach the repository: the committed Secret is a
-          # template, and it has to stay one.
-          if ! grep -q "REPLACE-ME" k8s/01-config.yaml; then
-            echo "::error file=k8s/01-config.yaml::The Secret template no longer contains its REPLACE-ME placeholders. Never commit a real credential."
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+            echo "::error::.env must never be committed."
             exit 1
           fi
+          test -z "$(git ls-files 'k8s/.generated/*')"
 
   dependency-review:
     name: Dependency review

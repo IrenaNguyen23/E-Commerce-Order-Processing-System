@@ -4,10 +4,13 @@ import react from '@vitejs/plugin-react';
 import { defineConfig, loadEnv } from 'vite';
 
 export default defineConfig(({ mode }) => {
-  const env = loadEnv(mode, process.cwd(), '');
-  const gateway = env.VITE_API_PROXY_TARGET || 'http://localhost:8080';
+  // Use the same .env as Compose. Docker builds receive only public VITE_* build args.
+  const envDir = path.resolve(__dirname, '..');
+  const env = loadEnv(mode, envDir, 'VITE_');
+  const gateway = env.VITE_API_PROXY_TARGET;
 
   return {
+    envDir,
     plugins: [react()],
 
     resolve: {
@@ -15,7 +18,7 @@ export default defineConfig(({ mode }) => {
     },
 
     server: {
-      port: 5173,
+      port: Number(env.VITE_DEV_PORT) || 5173,
       // Proxying in dev keeps the browser same-origin, so no CORS preflight and no divergence
       // from production, where nginx serves the bundle and forwards /api to the gateway.
       proxy: {
@@ -24,7 +27,7 @@ export default defineConfig(({ mode }) => {
       },
     },
 
-    preview: { port: 4173 },
+    preview: { port: Number(env.VITE_PREVIEW_PORT) || 4173 },
 
     build: {
       target: 'es2022',

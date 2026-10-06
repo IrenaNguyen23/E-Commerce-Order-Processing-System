@@ -19,6 +19,7 @@ The frontend is a service in the root `docker-compose.yml`:
 
 ```bash
 # from the repository root
+python scripts/env.py init      # first checkout only; preserves an existing .env
 docker compose up -d --build
 ```
 
@@ -28,7 +29,7 @@ docker compose up -d --build
 | API Gateway | http://localhost:8080 |
 | Swagger UI | http://localhost:8080/swagger-ui.html |
 | Kafka UI | http://localhost:8090 |
-| Grafana | http://localhost:3000 (`admin` / `admin`) |
+| Grafana | http://localhost:3000 (credentials in `.env`) |
 
 Then give it something to show:
 
@@ -41,9 +42,9 @@ to exist consistently. The script places real ones and waits for them.
 
 | Account | Password | |
 |---|---|---|
-| `ada@commerceflow.io` | `Demo-pass-2026` | 5 orders: three completed, one declined, one out of stock |
-| `liam@commerceflow.io` | `Demo-pass-2026` | 3 orders, one of them declined |
-| `admin@commerceflow.io` | `ChangeMe-Admin-2026` | The admin console |
+| `ada@commerceflow.io` | `DEMO_PASSWORD` in `.env` | 5 orders: three completed, one declined, one out of stock |
+| `liam@commerceflow.io` | `DEMO_PASSWORD` in `.env` | 3 orders, one of them declined |
+| `COMMERCEFLOW_BOOTSTRAP_ADMIN_EMAIL` in `.env` | `COMMERCEFLOW_BOOTSTRAP_ADMIN_PASSWORD` in `.env` | The admin console |
 
 Without the script the storefront works fine, but `/orders`, `/notifications` and every admin
 screen start empty — there is nothing to page, filter or chart yet.
@@ -54,7 +55,7 @@ Requires Node 20+.
 
 ```bash
 cd frontend
-cp .env.example .env      # optional; the defaults work
+# Vite reads ../.env, shared with Docker Compose
 npm install
 npm run dev               # http://localhost:5173
 ```
